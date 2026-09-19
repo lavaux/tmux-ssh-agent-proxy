@@ -54,8 +54,7 @@ impl StateFile {
             fs::create_dir_all(&dir).ok();
             return dir;
         }
-        let dir = PathBuf::from("/tmp")
-            .join(format!("tmux-ssh-agent-proxy-{}", getuid().as_raw()));
+        let dir = PathBuf::from("/tmp").join(format!("tmux-ssh-agent-proxy-{}", getuid().as_raw()));
         fs::create_dir_all(&dir).ok();
         dir
     }
@@ -95,8 +94,7 @@ impl StateFile {
             .with_context(|| "Failed to truncate state file")?;
         file.rewind()
             .with_context(|| "Failed to rewind state file")?;
-        serde_json::to_writer(&file, &state)
-            .with_context(|| "Failed to write state file")?;
+        serde_json::to_writer(&file, &state).with_context(|| "Failed to write state file")?;
 
         Ok(result)
     }

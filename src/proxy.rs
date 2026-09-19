@@ -32,7 +32,9 @@ impl ProxyAgent {
     /// 6. Clean up the socket file on exit.
     pub fn run(&self, ready: Option<Box<dyn FnOnce() + Send>>) -> Result<()> {
         let runtime_dir = StateFile::runtime_dir();
-        let hex: String = (0..16).map(|_| format!("{:02x}", rand::random::<u8>())).collect();
+        let hex: String = (0..16)
+            .map(|_| format!("{:02x}", rand::random::<u8>()))
+            .collect();
         let socket_path = runtime_dir.join(hex);
 
         let listener = UnixListener::bind(&socket_path)?;

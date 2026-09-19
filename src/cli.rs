@@ -1,7 +1,7 @@
 use crate::proxy::ProxyAgent;
 use crate::state::StateFile;
 use anyhow::{Context, Result};
-use nix::unistd::{fork, pipe, setsid, dup2, ForkResult};
+use nix::unistd::{dup2, fork, pipe, setsid, ForkResult};
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 
 /// Parse CLI arguments and dispatch to the matching subcommand handler.
@@ -27,7 +27,9 @@ pub fn run() -> Result<()> {
 
 /// Print usage information to stderr.
 fn print_usage() {
-    let name = std::env::args().next().unwrap_or_else(|| "tmux-ssh-agent".to_string());
+    let name = std::env::args()
+        .next()
+        .unwrap_or_else(|| "tmux-ssh-agent".to_string());
     eprintln!("Usage:");
     eprintln!("  {name} proxy");
     eprintln!("  {name} proxy --no-daemon");
@@ -67,8 +69,7 @@ fn start_daemonized_proxy() -> Result<()> {
             drop(write_end);
             let _ = read_end.into_raw_fd();
             let mut buf = [0u8; 2];
-            let n = nix::unistd::read(read_fd_raw, &mut buf)
-                .context("read ready signal")?;
+            let n = nix::unistd::read(read_fd_raw, &mut buf).context("read ready signal")?;
             nix::unistd::close(read_fd_raw)?;
             if n == 2 && &buf == b"ok" {
                 std::process::exit(0);
@@ -108,17 +109,13 @@ fn start_daemonized_proxy() -> Result<()> {
 /// Redirect stdin/stdout/stderr to /dev/null.
 /// Required for daemon processes to detach from the controlling terminal.
 fn redirect_stdio() -> Result<()> {
-    let devnull = std::fs::File::open("/dev/null")
-        .context("open /dev/null for stdin")?;
-    let devnull_out = std::fs::File::create("/dev/null")
-        .context("open /dev/null for stdout/stderr")?;
+    let devnull = std::fs::File::open("/dev/null").context("open /dev/null for stdin")?;
+    let devnull_out =
+        std::fs::File::create("/dev/null").context("open /dev/null for stdout/stderr")?;
 
-    dup2(devnull.as_raw_fd(), 0)
-        .context("dup2 stdin")?;
-    dup2(devnull_out.as_raw_fd(), 1)
-        .context("dup2 stdout")?;
-    dup2(devnull_out.as_raw_fd(), 2)
-        .context("dup2 stderr")?;
+    dup2(devnull.as_raw_fd(), 0).context("dup2 stdin")?;
+    dup2(devnull_out.as_raw_fd(), 1).context("dup2 stdout")?;
+    dup2(devnull_out.as_raw_fd(), 2).context("dup2 stderr")?;
 
     Ok(())
 }
@@ -194,7 +191,11 @@ fn get_tty() -> String {
             .ok()
             .and_then(|o| {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if s.is_empty() { None } else { Some(s) }
+                if s.is_empty() {
+                    None
+                } else {
+                    Some(s)
+                }
             })
             .unwrap_or_else(|| "unknown".to_string())
     })
