@@ -22,9 +22,29 @@ Binary at `target/release/tmux-ssh-agent`. Install it somewhere on `$PATH`:
 cp target/release/tmux-ssh-agent ~/.local/bin/
 ```
 
-## Usage
+## Setup
 
-### 1. Start the proxy inside tmux
+### Quick install
+
+```sh
+tmux-ssh-agent install
+```
+
+This adds the `run` command to `~/.tmux.conf` (backs up the original first). Reload tmux after:
+
+```sh
+tmux source-file ~/.tmux.conf
+```
+
+To also add the login registration snippet to `~/.bashrc`:
+
+```sh
+tmux-ssh-agent install --shell
+```
+
+### Manual setup
+
+#### 1. Start the proxy inside tmux
 
 Add to `~/.tmux.conf`:
 
@@ -40,7 +60,7 @@ To run in the foreground (debugging):
 tmux-ssh-agent proxy --no-daemon
 ```
 
-### 2. Register an agent on login
+#### 2. Register an agent on login
 
 In your shell profile (`~/.bashrc`, `~/.zshrc`, etc.):
 
@@ -52,7 +72,7 @@ fi
 
 This registers the current SSH agent for the current TTY. When you later use that TTY inside tmux (via `attach`, `new-window`, etc.), the proxy forwards to this agent.
 
-### 3. Register a default agent (optional)
+#### 3. Register a default agent (optional)
 
 ```sh
 tmux-ssh-agent register-default-agent
@@ -72,6 +92,7 @@ tmux-ssh-agent register-default-agent --override
 |---|---|
 | `proxy` | Start proxy daemon under tmux server |
 | `proxy --no-daemon` | Run proxy in foreground |
+| `install [--shell]` | Add config to `~/.tmux.conf` (and optionally shell profile) |
 | `register-agent [SSH_AUTH_SOCK]` | Register agent for current TTY (reads `SSH_AUTH_SOCK` or arg) |
 | `register-default-agent [--override] [SSH_AUTH_SOCK]` | Register fallback agent |
 | `list-agents` / `list` | List all registered agents, mark current TTY with `*` |

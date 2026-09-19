@@ -17,6 +17,7 @@ pub fn run() -> Result<()> {
         "proxy" => cmd_proxy(&args[2..]),
         "register-agent" => cmd_register_agent(&args[2..]),
         "register-default-agent" => cmd_register_default_agent(&args[2..]),
+        "install" => cmd_install(&args[2..]),
         "list" | "list-agents" => cmd_list_agents(),
         _ => {
             print_usage();
@@ -33,6 +34,7 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  {name} proxy");
     eprintln!("  {name} proxy --no-daemon");
+    eprintln!("  {name} install [--shell]");
     eprintln!("  {name} register-agent [SSH_AUTH_SOCK]");
     eprintln!("  {name} register-default-agent [--override] [SSH_AUTH_SOCK]");
     eprintln!("  {name} list-agents");
@@ -117,6 +119,139 @@ fn redirect_stdio() -> Result<()> {
     dup2(devnull_out.as_raw_fd(), 1).context("dup2 stdout")?;
     dup2(devnull_out.as_raw_fd(), 2).context("dup2 stderr")?;
 
+    Ok(())
+}
+
+/// Handle the `install` subcommand.
+/// Adds `run 'tmux-ssh-agent proxy'` to `~/.tmux.conf` if not already present.
+/// Backs up the original file before modifying.
+/// With `--shell`, also adds the login registration snippet to `~/.bashrc`.
+fn cmd_install(args: &[String]) -> Result<()> {
+    let add_shell = args.contains(&"--shell".to_string());
+
+    install_tmux_config()?;
+    if add_shell {
+        install_shell_profile()?;
+    }
+
+    println!("Install complete. Reload tmux: tmux source-file ~/.tmux.conf");
+    if !add_shell {
+        println!("To auto-register agents on login, run with --shell or add the snippet manually:");
+        println!("  if [ -z \"$TMUX\" ] && [ -n \"$SSH_AUTH_SOCK\" ]; then");
+        println!("    tmux-ssh-agent register-agent");
+        println!("  fi");
+    }
+    Ok(())
+}
+
+/// Add the `run 'tmux-ssh-agent proxy'` line to `~/.tmux.conf`.
+/// Creates the file if it doesn't exist, backs it up otherwise.
+fn install_tmux_config() -> Result<()> {
+    use std::io::{Read, Write};
+
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let path = std::path::PathBuf::from(home).join(".tmux.conf");
+    let line = "run 'tmux-ssh-agent proxy'";
+
+    let mut contents = String::new();
+    let exists = path.exists();
+
+    if exists {
+        let mut file = std::fs::File::open(&path)?;
+        file.read_to_string(&mut contents)?;
+
+        if contents.lines().any(|l| l.trim() == line) {
+            println!("Already present in {}: {}", path.display(), line);
+            return Ok(());
+        }
+
+        // Back up
+        let backup = path.with_extension("tmux.conf.bak");
+        std::fs::copy(&path, &backup)
+            .with_context(|| format!("Failed to back up {} to {:?}", path.display(), backup))?;
+        println!("Backed up {} -> {:?}", path.display(), backup);
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+
+    if !exists {
+        writeln!(file, "{}", line)?;
+    } else {
+        writeln!(file)?;
+        writeln!(file, "# Added by tmux-ssh-agent install")?;
+        writeln!(file, "{}", line)?;
+    }
+
+    println!("Added to {}: {}", path.display(), line);
+    Ok(())
+}
+
+/// Add the login registration snippet to `~/.bashrc`.
+/// Detects which shell config file exists (~/.bashrc > ~/.zshrc > ~/.config/fish/config.fish).
+fn install_shell_profile() -> Result<()> {
+    use std::io::{Read, Write};
+
+    let home = std::env::var("HOME").context("HOME not set")?;
+
+    let candidates = [".bashrc", ".zshrc", ".config/fish/config.fish"];
+
+    let mut profile = None;
+    for cand in &candidates {
+        let p = std::path::PathBuf::from(&home).join(cand);
+        if p.exists() {
+            profile = Some(p);
+            break;
+        }
+    }
+
+    let path = match profile {
+        Some(p) => p,
+        None => {
+            // Default to .bashrc
+            let p = std::path::PathBuf::from(&home).join(".bashrc");
+            std::fs::File::create(&p)?;
+            p
+        }
+    };
+
+    let snippet_start = "# Added by tmux-ssh-agent install";
+    let snippet = format!(
+        "{}\nif [ -z \"$TMUX\" ] && [ -n \"$SSH_AUTH_SOCK\" ]; then\n  tmux-ssh-agent register-agent\nfi\n",
+        snippet_start
+    );
+
+    let mut contents = String::new();
+    if path.exists() {
+        let mut file = std::fs::File::open(&path)?;
+        file.read_to_string(&mut contents)?;
+
+        if contents.contains(snippet_start) {
+            println!(
+                "Already present in {}: registration snippet",
+                path.display()
+            );
+            return Ok(());
+        }
+
+        // Back up
+        let backup = path.with_extension("bak");
+        std::fs::copy(&path, &backup)
+            .with_context(|| format!("Failed to back up {} to {:?}", path.display(), backup))?;
+        println!("Backed up {} -> {:?}", path.display(), backup);
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+
+    writeln!(file)?;
+    write!(file, "{}", snippet)?;
+
+    println!("Added registration snippet to {}", path.display());
     Ok(())
 }
 
