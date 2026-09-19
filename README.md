@@ -61,7 +61,7 @@ export XDG_RUNTIME_DIR="$HOME/.tmux-ssh-agent"
 
 **Canonical paths.** `/tmp` and `/var` are symlinks into `/private`, so a registered agent socket is stored and displayed in its resolved form. `list-agents` will show `/private/tmp/...` where you typed `/tmp/...`. This is cosmetic, but it also lengthens the path, which matters near the limit above.
 
-There is a runtime smoke test at `contrib/macos-smoke-test.sh` covering startup, permissions, forwarding, per-pane routing and shutdown.
+There is a runtime smoke test at `contrib/macos-smoke-test.sh` covering startup, permissions, forwarding, per-pane routing and shutdown. `contrib/linux-smoke-test.sh` is the Linux equivalent.
 
 ### Portability note
 

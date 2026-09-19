@@ -36,8 +36,23 @@ SOCKET_DIR="$T/rt"
 export TMUX_TMPDIR="$T/tmux"
 mkdir -p "$SOCKET_DIR" "$TMUX_TMPDIR"
 
+# Pids of daemons using OUR scratch runtime dir. `ps -E` prints a process's
+# environment on macOS.
+#
+# Never `pkill -x tmux-ssh-agent`: the machine running this very likely has the
+# user's own proxy running against their real runtime directory, and killing it
+# would drop their agent out from under them.
+our_daemons() {
+  for p in $(pgrep -x tmux-ssh-agent 2>/dev/null); do
+    if ps -Eww -p "$p" 2>/dev/null | grep -qF "TMPDIR=$SOCKET_DIR"; then
+      echo "$p"
+    fi
+  done
+}
+our_daemon_count() { our_daemons | grep -c . ; }
+
 cleanup() {
-  pkill -x tmux-ssh-agent 2>/dev/null
+  for p in $(our_daemons); do kill "$p" 2>/dev/null; done
   for n in 1 2; do
     [ -S "$T/ag$n.sock" ] && SSH_AUTH_SOCK="$T/ag$n.sock" ssh-agent -k >/dev/null 2>&1
   done
@@ -61,7 +76,7 @@ if cargo test >/dev/null 2>&1; then ok "cargo test"; else bad "cargo test (run '
 
 head_ "2. Daemon starts"
 tmux -L smoke kill-server 2>/dev/null; sleep 0.3
-tmux -L smoke new-session -d -s s1 bash
+tmux -L smoke -f /dev/null new-session -d -s s1 bash
 # BSD script takes the command as trailing arguments, unlike Linux's -c form.
 script -q /dev/null tmux -L smoke attach -t s1 >/dev/null 2>&1 &
 sleep 2
@@ -112,7 +127,7 @@ else
 fi
 
 head_ "6. Per-pane routing (the parity test)"
-tmux -L smoke new-session -d -s s2 bash
+tmux -L smoke -f /dev/null new-session -d -s s2 bash
 script -q /dev/null tmux -L smoke attach -t s2 >/dev/null 2>&1 &
 sleep 2
 TTY2=$(tmux -L smoke list-clients -F '#{client_tty} #{session_name}' | awk '$2=="s2"{print $1}')
@@ -148,9 +163,9 @@ else
 fi
 
 head_ "8. Shutdown is clean"
-pkill -TERM -x tmux-ssh-agent 2>/dev/null
+for p in $(our_daemons); do kill -TERM "$p" 2>/dev/null; done
 sleep 5
-[ "$(pgrep -xc tmux-ssh-agent 2>/dev/null || echo 0)" = "0" ] && ok "daemon exited" || bad "daemon still running"
+[ "$(our_daemon_count)" = "0" ] && ok "daemon exited" || bad "daemon still running"
 LEFT=$(ls -1 "$RT" 2>/dev/null | grep -v -e '^state$' -e '^proxy.lock$' | wc -l | tr -d ' ')
 [ "$LEFT" = "0" ] && ok "socket removed on SIGTERM" || bad "$LEFT socket(s) left behind"
 
