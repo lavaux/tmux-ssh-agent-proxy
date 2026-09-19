@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Lints
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+  msrv:
+    runs-on: docker
+    steps:
+      - uses: actions/checkout@v4
+
+      # The README and Cargo.toml claim a minimum supported Rust version.
+      # Build against exactly that toolchain so the claim cannot rot.
+      - name: Install the declared MSRV toolchain
+        run: |
+          rustup toolchain install 1.71 --profile minimal
+          rustup default 1.71
+
+      - name: Build
+        run: cargo build --all-targets

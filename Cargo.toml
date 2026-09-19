@@ -2,6 +2,10 @@
 name = "tmux-ssh-agent"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.71"
+description = "Transparent SSH agent proxy for tmux: each client gets its own agent"
+license = "MIT"
+readme = "README.md"
 
 [dependencies]
 anyhow = "1"

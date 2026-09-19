@@ -91,3 +91,75 @@ pub fn validate_agent_socket(path: &str) -> Result<String> {
 
     Ok(canonical.to_string_lossy().into_owned())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn packets_round_trip() {
+        let payload = b"\x0bhello agent".to_vec();
+        let mut buf = Vec::new();
+        send_packet(&mut buf, &payload).expect("send");
+
+        assert_eq!(&buf[..4], &(payload.len() as u32).to_be_bytes());
+
+        let mut cursor = Cursor::new(buf);
+        let got = recv_packet(&mut cursor).expect("recv").expect("a packet");
+        assert_eq!(got, payload);
+    }
+
+    #[test]
+    fn clean_eof_is_not_an_error() {
+        let mut empty = Cursor::new(Vec::new());
+        assert_eq!(recv_packet(&mut empty).expect("eof is ok"), None);
+    }
+
+    /// The reason for the cap: the length prefix comes from the peer, and
+    /// allocating it unchecked let four bytes ask for 4 GiB.
+    #[test]
+    fn oversized_length_is_rejected_without_allocating() {
+        let mut hostile = Cursor::new(vec![0xff, 0xff, 0xff, 0xff]);
+        let err = recv_packet(&mut hostile).expect_err("must be rejected");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn length_at_the_limit_is_accepted() {
+        let payload = vec![0u8; MAX_PACKET_LEN];
+        let mut buf = Vec::new();
+        send_packet(&mut buf, &payload).expect("send");
+        let mut cursor = Cursor::new(buf);
+        assert_eq!(
+            recv_packet(&mut cursor)
+                .expect("recv")
+                .expect("packet")
+                .len(),
+            MAX_PACKET_LEN
+        );
+    }
+
+    #[test]
+    fn one_byte_over_the_limit_is_rejected() {
+        let len = (MAX_PACKET_LEN as u32 + 1).to_be_bytes();
+        let mut cursor = Cursor::new(len.to_vec());
+        assert!(recv_packet(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn zero_length_is_rejected() {
+        let mut cursor = Cursor::new(vec![0, 0, 0, 0]);
+        assert!(recv_packet(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn truncated_payload_is_an_error_not_a_silent_eof() {
+        // Claims four bytes, supplies two.
+        let mut cursor = Cursor::new(vec![0, 0, 0, 4, 1, 2]);
+        assert!(recv_packet(&mut cursor).is_err());
+    }
+}

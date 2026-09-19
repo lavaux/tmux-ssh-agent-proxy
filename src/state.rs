@@ -248,3 +248,206 @@ fn validate_runtime_dir(dir: &Path) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    /// A scratch directory that cleans itself up.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "tsa-test-{tag}-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("temp dir");
+            Self(dir)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn state_file(dir: &TempDir) -> StateFile {
+        StateFile::new(dir.path().join("state"))
+    }
+
+    #[test]
+    fn round_trips_a_registration() {
+        let dir = TempDir::new("roundtrip");
+        let sock = dir.path().join("agent.sock");
+        let _listener = UnixListener::bind(&sock).expect("bind");
+        let sf = state_file(&dir);
+
+        sf.with_lock(|s| {
+            s.agents
+                .insert("/dev/pts/1".into(), sock.to_string_lossy().into_owned());
+        })
+        .expect("write");
+
+        let got = sf
+            .with_lock_read(|s| s.agents.get("/dev/pts/1").cloned())
+            .expect("read");
+        assert_eq!(got, Some(sock.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn state_file_is_created_private() {
+        let dir = TempDir::new("mode");
+        let sf = state_file(&dir);
+        sf.with_lock(|_| {}).expect("write");
+
+        let mode = fs::metadata(dir.path().join("state")).expect("stat").mode();
+        assert_eq!(mode & 0o777, STATE_FILE_MODE, "state file must be 0600");
+    }
+
+    #[test]
+    fn a_state_file_left_world_readable_is_tightened() {
+        let dir = TempDir::new("tighten");
+        let path = dir.path().join("state");
+        fs::write(&path, "{}").expect("seed");
+        fs::set_permissions(&path, Permissions::from_mode(0o644)).expect("chmod");
+
+        StateFile::new(path.clone())
+            .with_lock(|_| {})
+            .expect("write");
+
+        assert_eq!(fs::metadata(&path).expect("stat").mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn cleanup_drops_agents_whose_socket_is_gone() {
+        let dir = TempDir::new("cleanup");
+        let live = dir.path().join("live.sock");
+        let _listener = UnixListener::bind(&live).expect("bind");
+
+        let mut state = State {
+            agents: HashMap::from([
+                ("/dev/pts/1".into(), live.to_string_lossy().into_owned()),
+                ("/dev/pts/2".into(), "/nonexistent/agent.sock".into()),
+            ]),
+            default_agent: Some("/nonexistent/default.sock".into()),
+        };
+        state.cleanup();
+
+        assert!(state.agents.contains_key("/dev/pts/1"));
+        assert!(!state.agents.contains_key("/dev/pts/2"));
+        assert_eq!(state.default_agent, None);
+    }
+
+    #[test]
+    fn cleanup_drops_keys_that_were_never_real_ttys() {
+        let mut state = State {
+            agents: HashMap::from([
+                ("not a tty".into(), "/tmp/a".into()),
+                ("unknown".into(), "/tmp/b".into()),
+            ]),
+            default_agent: None,
+        };
+        state.cleanup();
+        assert!(state.agents.is_empty());
+    }
+
+    /// Losing every registration to a parse error used to happen silently, and
+    /// the empty state was written straight back.
+    #[test]
+    fn corrupt_state_does_not_abort_the_command() {
+        let dir = TempDir::new("corrupt");
+        let path = dir.path().join("state");
+        fs::write(&path, "{ this is not json").expect("seed");
+
+        let sf = StateFile::new(path);
+        let count = sf.with_lock_read(|s| s.agents.len()).expect("read");
+        assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn concurrent_writers_do_not_lose_entries() {
+        let dir = TempDir::new("concurrent");
+        let path = dir.path().join("state");
+
+        // Real sockets, so cleanup does not drop them between writes.
+        let socks: Vec<_> = (0..8)
+            .map(|i| {
+                let p = dir.path().join(format!("a{i}.sock"));
+                let l = UnixListener::bind(&p).expect("bind");
+                (p, l)
+            })
+            .collect();
+
+        std::thread::scope(|scope| {
+            for (i, (sock, _)) in socks.iter().enumerate() {
+                let path = path.clone();
+                scope.spawn(move || {
+                    StateFile::new(path)
+                        .with_lock(|s| {
+                            s.agents.insert(
+                                format!("/dev/pts/{i}"),
+                                sock.to_string_lossy().into_owned(),
+                            );
+                        })
+                        .expect("write");
+                });
+            }
+        });
+
+        let n = StateFile::new(path)
+            .with_lock_read(|s| s.agents.len())
+            .expect("read");
+        assert_eq!(n, 8, "every writer's entry must survive");
+    }
+
+    #[test]
+    fn runtime_dir_is_created_private_even_under_a_lax_umask() {
+        let dir = TempDir::new("runtimedir");
+        let target = dir.path().join("runtime");
+
+        let old = nix::sys::stat::umask(nix::sys::stat::Mode::empty());
+        let result = ensure_runtime_dir(&target);
+        nix::sys::stat::umask(old);
+        result.expect("create");
+
+        let mode = fs::metadata(&target).expect("stat").mode() & 0o777;
+        assert_eq!(mode, RUNTIME_DIR_MODE, "runtime dir must be 0700");
+    }
+
+    #[test]
+    fn an_existing_loose_runtime_dir_is_tightened() {
+        let dir = TempDir::new("loose");
+        let target = dir.path().join("runtime");
+        fs::create_dir(&target).expect("mkdir");
+        fs::set_permissions(&target, Permissions::from_mode(0o755)).expect("chmod");
+
+        ensure_runtime_dir(&target).expect("validate");
+
+        assert_eq!(
+            fs::metadata(&target).expect("stat").mode() & 0o777,
+            RUNTIME_DIR_MODE
+        );
+    }
+
+    #[test]
+    fn a_symlinked_runtime_dir_is_refused() {
+        let dir = TempDir::new("symlink");
+        let real = dir.path().join("real");
+        fs::create_dir(&real).expect("mkdir");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).expect("symlink");
+
+        assert!(
+            ensure_runtime_dir(&link).is_err(),
+            "a symlinked runtime directory must be refused"
+        );
+    }
+}

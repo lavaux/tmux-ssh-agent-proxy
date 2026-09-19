@@ -6,6 +6,7 @@ use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::{dup2, fork, pipe, setsid, ForkResult};
+use std::io::Write;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
@@ -19,6 +20,14 @@ pub fn run() -> Result<()> {
     }
 
     match args[1].as_str() {
+        "--help" | "-h" | "help" => {
+            print_usage_to(&mut std::io::stdout());
+            Ok(())
+        }
+        "--version" | "-V" => {
+            println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         "proxy" => cmd_proxy(&args[2..]),
         "register-agent" => cmd_register_agent(&args[2..]),
         "register-default-agent" => cmd_register_default_agent(&args[2..]),
@@ -26,7 +35,7 @@ pub fn run() -> Result<()> {
         "uninstall" => cmd_uninstall(&args[2..]),
         "list" | "list-agents" => cmd_list_agents(),
         "remove-agent" => cmd_remove_agent(&args[2..]),
-        "clear-agents" => cmd_clear_agents(),
+        "clear-agents" => cmd_clear_agents(&args[2..]),
         _ => {
             print_usage();
             std::process::exit(1);
@@ -36,25 +45,49 @@ pub fn run() -> Result<()> {
 
 /// Print usage information to stderr.
 fn print_usage() {
+    print_usage_to(&mut std::io::stderr());
+}
+
+/// Print usage information to `out`, so an explicit `--help` can go to stdout
+/// while a usage error goes to stderr.
+fn print_usage_to(out: &mut dyn std::io::Write) {
     let name = std::env::args()
         .next()
         .unwrap_or_else(|| "tmux-ssh-agent".to_string());
-    eprintln!("Usage:");
-    eprintln!("  {name} proxy");
-    eprintln!("  {name} proxy --no-daemon");
-    eprintln!("  {name} install [--shell]");
-    eprintln!("  {name} uninstall [--shell]");
-    eprintln!("  {name} register-agent [SSH_AUTH_SOCK]");
-    eprintln!("  {name} register-default-agent [--override] [SSH_AUTH_SOCK]");
-    eprintln!("  {name} remove-agent [TTY]");
-    eprintln!("  {name} clear-agents");
-    eprintln!("  {name} list-agents");
+    let _ = writeln!(out, "Usage:");
+    let _ = writeln!(out, "  {name} proxy [--no-daemon]");
+    let _ = writeln!(out, "  {name} install [--shell]");
+    let _ = writeln!(out, "  {name} uninstall [--shell]");
+    let _ = writeln!(out, "  {name} register-agent [SSH_AUTH_SOCK]");
+    let _ = writeln!(
+        out,
+        "  {name} register-default-agent [--override] [SSH_AUTH_SOCK]"
+    );
+    let _ = writeln!(out, "  {name} remove-agent [TTY]");
+    let _ = writeln!(out, "  {name} clear-agents [--yes]");
+    let _ = writeln!(out, "  {name} list-agents");
+    let _ = writeln!(out, "  {name} --help | --version");
+}
+
+/// Reject any option this subcommand does not understand.
+///
+/// Flags used to be matched with `args.contains(..)`, so a typo such as
+/// `--shel` was accepted and silently did nothing.
+fn reject_unknown_flags(args: &[String], allowed: &[&str]) -> Result<()> {
+    for arg in args {
+        if arg.starts_with('-') && !allowed.contains(&arg.as_str()) {
+            anyhow::bail!("Unknown option {arg:?}. Run with --help for usage.");
+        }
+    }
+    Ok(())
 }
 
 /// Handle the `proxy` subcommand.
 /// Requires `TMUX` environment variable to be set (verifies we're inside tmux).
 /// Without `--no-daemon`, forks and daemonizes; with it, runs in the foreground.
 fn cmd_proxy(args: &[String]) -> Result<()> {
+    reject_unknown_flags(args, &["--no-daemon"])?;
+
     if std::env::var("TMUX").is_err() {
         anyhow::bail!("Not running under tmux server");
     }
@@ -227,6 +260,7 @@ fn detect_profile() -> Result<(PathBuf, Shell)> {
 /// With `--shell`, also adds the login registration snippet to the profile
 /// matching `$SHELL`.
 fn cmd_install(args: &[String]) -> Result<()> {
+    reject_unknown_flags(args, &["--shell"])?;
     let add_shell = args.contains(&"--shell".to_string());
 
     apply_install(&home()?.join(".tmux.conf"), &config_edit::tmux_snippet())?;
@@ -278,6 +312,7 @@ fn apply_install(path: &Path, body: &[String]) -> Result<()> {
 /// Removes the proxy block from `~/.tmux.conf`, and with `--shell` the login
 /// snippet from every shell profile that carries one.
 fn cmd_uninstall(args: &[String]) -> Result<()> {
+    reject_unknown_flags(args, &["--shell"])?;
     let remove_shell = args.contains(&"--shell".to_string());
 
     apply_uninstall(&home()?.join(".tmux.conf"), &config_edit::tmux_snippet())?;
@@ -341,6 +376,7 @@ fn apply_uninstall(path: &Path, body: &[String]) -> Result<bool> {
 /// Registers the given agent socket (or `$SSH_AUTH_SOCK`) for the current TTY.
 /// Args: optional explicit socket path; env var `SSH_AUTH_SOCK` is used as fallback.
 fn cmd_register_agent(args: &[String]) -> Result<()> {
+    reject_unknown_flags(args, &[])?;
     let tty = require_tty()?;
     let agent = args
         .first()
@@ -360,6 +396,7 @@ fn cmd_register_agent(args: &[String]) -> Result<()> {
 /// `--override` replaces an existing default; without it the first registration wins.
 /// Args: optional explicit socket path; env var `SSH_AUTH_SOCK` is used as fallback.
 fn cmd_register_default_agent(args: &[String]) -> Result<()> {
+    reject_unknown_flags(args, &["--override"])?;
     let override_flag = args.contains(&"--override".to_string());
     let agent = args
         .iter()
@@ -404,6 +441,7 @@ fn cmd_list_agents() -> Result<()> {
 /// Handle the `remove-agent` subcommand.
 /// Removes the registration for the given TTY, or current TTY if none specified.
 fn cmd_remove_agent(args: &[String]) -> Result<()> {
+    reject_unknown_flags(args, &[])?;
     let tty = match args.first() {
         Some(t) => t.clone(),
         None => require_tty()?,
@@ -420,7 +458,16 @@ fn cmd_remove_agent(args: &[String]) -> Result<()> {
 
 /// Handle the `clear-agents` subcommand.
 /// Removes all per-TTY agent registrations and the default agent.
-fn cmd_clear_agents() -> Result<()> {
+/// Asks for confirmation unless `--yes` is given.
+fn cmd_clear_agents(args: &[String]) -> Result<()> {
+    reject_unknown_flags(args, &["--yes", "-y"])?;
+
+    let assume_yes = args.iter().any(|a| a == "--yes" || a == "-y");
+    if !assume_yes && !confirm("Remove all agent registrations?")? {
+        println!("Aborted");
+        return Ok(());
+    }
+
     let state_file = StateFile::open_default()?;
     state_file.with_lock(|state| {
         state.agents.clear();
@@ -428,6 +475,29 @@ fn cmd_clear_agents() -> Result<()> {
     })?;
     println!("Cleared all agent registrations");
     Ok(())
+}
+
+/// Ask the user to confirm a destructive action.
+/// With no terminal to ask on, refuse rather than assume yes.
+fn confirm(question: &str) -> Result<bool> {
+    use std::io::IsTerminal;
+
+    if !std::io::stdin().is_terminal() {
+        anyhow::bail!("{question} Not running interactively, so pass --yes to confirm.");
+    }
+
+    print!("{question} [y/N] ");
+    std::io::stdout().flush().ok();
+
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("Failed to read confirmation")?;
+
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 /// Get the current TTY path, if there is one.
