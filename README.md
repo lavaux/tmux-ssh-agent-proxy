@@ -93,6 +93,7 @@ tmux-ssh-agent register-default-agent --override
 | `proxy` | Start proxy daemon under tmux server |
 | `proxy --no-daemon` | Run proxy in foreground |
 | `install [--shell]` | Add config to `~/.tmux.conf` (and optionally shell profile) |
+| `uninstall [--shell]` | Remove config from `~/.tmux.conf` (and optionally shell profile) |
 | `register-agent [SSH_AUTH_SOCK]` | Register agent for current TTY (reads `SSH_AUTH_SOCK` or arg) |
 | `register-default-agent [--override] [SSH_AUTH_SOCK]` | Register fallback agent |
 | `list-agents` / `list` | List all registered agents, mark current TTY with `*` |

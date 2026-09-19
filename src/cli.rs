@@ -18,6 +18,7 @@ pub fn run() -> Result<()> {
         "register-agent" => cmd_register_agent(&args[2..]),
         "register-default-agent" => cmd_register_default_agent(&args[2..]),
         "install" => cmd_install(&args[2..]),
+        "uninstall" => cmd_uninstall(&args[2..]),
         "list" | "list-agents" => cmd_list_agents(),
         _ => {
             print_usage();
@@ -35,6 +36,7 @@ fn print_usage() {
     eprintln!("  {name} proxy");
     eprintln!("  {name} proxy --no-daemon");
     eprintln!("  {name} install [--shell]");
+    eprintln!("  {name} uninstall [--shell]");
     eprintln!("  {name} register-agent [SSH_AUTH_SOCK]");
     eprintln!("  {name} register-default-agent [--override] [SSH_AUTH_SOCK]");
     eprintln!("  {name} list-agents");
@@ -252,6 +254,164 @@ fn install_shell_profile() -> Result<()> {
     write!(file, "{}", snippet)?;
 
     println!("Added registration snippet to {}", path.display());
+    Ok(())
+}
+
+/// Handle the `uninstall` subcommand.
+/// Removes `run 'tmux-ssh-agent proxy'` from `~/.tmux.conf`.
+/// Backs up the original file before modifying.
+/// With `--shell`, also removes the login registration snippet from shell profile.
+fn cmd_uninstall(args: &[String]) -> Result<()> {
+    let remove_shell = args.contains(&"--shell".to_string());
+
+    uninstall_tmux_config()?;
+    if remove_shell {
+        uninstall_shell_profile()?;
+    }
+
+    println!("Uninstall complete. Reload tmux: tmux source-file ~/.tmux.conf");
+    Ok(())
+}
+
+/// Remove the `run 'tmux-ssh-agent proxy'` line (and its preceding comment) from `~/.tmux.conf`.
+fn uninstall_tmux_config() -> Result<()> {
+    use std::io::{Read, Write};
+
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let path = std::path::PathBuf::from(home).join(".tmux.conf");
+    let run_line = "run 'tmux-ssh-agent proxy'";
+    let marker = "# Added by tmux-ssh-agent install";
+
+    if !path.exists() {
+        println!("Not found: {}", path.display());
+        return Ok(());
+    }
+
+    let mut contents = String::new();
+    std::fs::File::open(&path)?.read_to_string(&mut contents)?;
+
+    let has_run = contents.lines().any(|l| l.trim() == run_line);
+    if !has_run {
+        println!("Not found in {}: {}", path.display(), run_line);
+        return Ok(());
+    }
+
+    // Back up
+    let backup = path.with_extension("tmux.conf.bak");
+    std::fs::copy(&path, &backup)
+        .with_context(|| format!("Failed to back up {} to {:?}", path.display(), backup))?;
+    println!("Backed up {} -> {:?}", path.display(), backup);
+
+    // Filter out lines: remove run_line, marker, and adjacent blank lines around the block.
+    let mut result: Vec<&str> = Vec::new();
+    let lines: Vec<&str> = contents.lines().collect();
+    let mut i = 0;
+
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+
+        if trimmed == run_line {
+            // Remove a preceding blank line if it exists
+            if let Some(&prev) = result.last() {
+                if prev.trim().is_empty() {
+                    result.pop();
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        if trimmed == marker {
+            // Remove a preceding blank line if it exists
+            if let Some(&prev) = result.last() {
+                if prev.trim().is_empty() {
+                    result.pop();
+                }
+            }
+            // Skip marker line and the next line (run line)
+            i += 2;
+            continue;
+        }
+
+        result.push(lines[i]);
+        i += 1;
+    }
+
+    let mut file = std::fs::File::create(&path)?;
+    for line in &result {
+        writeln!(file, "{}", line)?;
+    }
+
+    println!("Removed from {}: {}", path.display(), run_line);
+    Ok(())
+}
+
+/// Remove the login registration snippet from shell profile.
+fn uninstall_shell_profile() -> Result<()> {
+    use std::io::{Read, Write};
+
+    let home = std::env::var("HOME").context("HOME not set")?;
+    let candidates = [".bashrc", ".zshrc", ".config/fish/config.fish"];
+
+    let mut removed = false;
+    for cand in &candidates {
+        let path = std::path::PathBuf::from(&home).join(cand);
+        if !path.exists() {
+            continue;
+        }
+
+        let mut contents = String::new();
+        std::fs::File::open(&path)?.read_to_string(&mut contents)?;
+
+        let marker = "# Added by tmux-ssh-agent install";
+        if !contents.contains(marker) {
+            continue;
+        }
+
+        // Back up
+        let backup = path.with_extension("bak");
+        std::fs::copy(&path, &backup)
+            .with_context(|| format!("Failed to back up {} to {:?}", path.display(), backup))?;
+        println!("Backed up {} -> {:?}", path.display(), backup);
+
+        // Remove lines from marker to the closing 'fi'
+        let mut result: Vec<&str> = Vec::new();
+        let lines: Vec<&str> = contents.lines().collect();
+        let mut i = 0;
+
+        while i < lines.len() {
+            if lines[i].trim() == marker {
+                // Skip lines until we hit 'fi'
+                i += 1;
+                while i < lines.len() && lines[i].trim() != "fi" {
+                    i += 1;
+                }
+                i += 1; // skip 'fi'
+                        // Remove a preceding blank line if it exists
+                if let Some(&prev) = result.last() {
+                    if prev.trim().is_empty() {
+                        result.pop();
+                    }
+                }
+                continue;
+            }
+            result.push(lines[i]);
+            i += 1;
+        }
+
+        let mut file = std::fs::File::create(&path)?;
+        for line in &result {
+            writeln!(file, "{}", line)?;
+        }
+
+        println!("Removed registration snippet from {}", path.display());
+        removed = true;
+    }
+
+    if !removed {
+        println!("No registration snippet found in shell profile");
+    }
+
     Ok(())
 }
 
