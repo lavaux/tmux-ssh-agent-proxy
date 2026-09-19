@@ -4,11 +4,48 @@ use std::process::Command;
 /// Check whether the tmux server is still alive.
 /// Returns `false` when tmux has exited or is unreachable.
 pub fn ping() -> bool {
-    Command::new("tmux")
+    matches!(probe(), Ok(true))
+}
+
+/// Why a tmux probe did not succeed.
+#[derive(Debug)]
+pub enum ProbeError {
+    /// No `tmux` binary on `$PATH`.
+    NotFound,
+    /// The binary is there but could not be run.
+    Failed(std::io::Error),
+}
+
+impl std::fmt::Display for ProbeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Worth spelling out: on macOS tmux comes from Homebrew, in
+            // /opt/homebrew/bin or /usr/local/bin, and neither is on the
+            // default PATH a launchd-started process inherits.
+            Self::NotFound => write!(
+                f,
+                "no `tmux` binary found on $PATH (PATH={})",
+                std::env::var("PATH").unwrap_or_default()
+            ),
+            Self::Failed(e) => write!(f, "could not run `tmux`: {e}"),
+        }
+    }
+}
+
+/// Run `tmux display-message` and report what happened.
+///
+/// `ping` collapses this to a bool for the accept loop, but startup wants the
+/// distinction: "tmux is not installed" and "the server has exited" are very
+/// different problems and used to be indistinguishable.
+pub fn probe() -> std::result::Result<bool, ProbeError> {
+    match Command::new("tmux")
         .args(["display-message", "-p", "1"])
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
-        .unwrap_or(false)
+    {
+        Ok(o) => Ok(String::from_utf8_lossy(&o.stdout).trim() == "1"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(ProbeError::NotFound),
+        Err(e) => Err(ProbeError::Failed(e)),
+    }
 }
 
 /// Set a global tmux environment variable (`tmux set-environment -g`).

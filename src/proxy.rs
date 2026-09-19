@@ -7,6 +7,7 @@ use fs2::FileExt;
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::sys::stat::{umask, Mode};
 use std::fs::Permissions;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::io::AsFd;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -20,6 +21,24 @@ use std::time::{Duration, Instant};
 /// permission on it, so anything looser hands the upstream SSH agent to every
 /// local account.
 const SOCKET_MODE: u32 = 0o600;
+
+/// Usable bytes in `sockaddr_un.sun_path`, less the NUL terminator.
+///
+/// Linux gives 108, the BSDs including Darwin give 104. This is a real
+/// constraint rather than a formality on macOS, where `$TMPDIR` is a per-user
+/// path around 49 characters before anything of ours is appended.
+#[cfg(target_os = "linux")]
+const MAX_SOCKET_PATH_LEN: usize = 107;
+#[cfg(not(target_os = "linux"))]
+const MAX_SOCKET_PATH_LEN: usize = 103;
+
+/// Bytes of randomness in the socket name, rendered as twice as many hex
+/// characters.
+///
+/// Eight keeps the whole path inside Darwin's limit with room to spare. The
+/// socket sits in a 0700 directory whose ownership is checked, so the name is
+/// not an access control boundary and 64 bits is ample against collision.
+const SOCKET_NAME_BYTES: usize = 8;
 
 /// How long to wait for a connection before checking whether tmux is still
 /// alive. The listener wakes immediately on a connection, so this is the idle
@@ -141,8 +160,15 @@ fn sweep_stale_sockets(runtime_dir: &Path) {
             Ok(meta) if meta.file_type().is_socket() => {}
             _ => continue,
         }
-        if UnixStream::connect(&path).is_err() {
-            let _ = std::fs::remove_file(&path);
+        // Only a refused connection proves nobody is listening. Treating every
+        // error as "stale" would unlink a socket a live daemon is serving when
+        // the failure was, say, a path too long or a transient permission error.
+        match UnixStream::connect(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(_) => {}
         }
     }
 }
@@ -177,10 +203,11 @@ impl ProxyAgent {
         // the invoking shell would publish a world-usable agent socket.
         umask(Mode::from_bits_truncate(0o077));
 
-        let hex: String = (0..16)
+        let hex: String = (0..SOCKET_NAME_BYTES)
             .map(|_| format!("{:02x}", rand::random::<u8>()))
             .collect();
         let socket_path = runtime_dir.join(hex);
+        check_socket_path_fits(&socket_path)?;
 
         let Some(_instance) = InstanceLock::acquire(&runtime_dir)? else {
             // Another daemon is already serving this tmux server. Report success
@@ -266,6 +293,23 @@ impl ProxyAgent {
 
         Ok(())
     }
+}
+
+/// Refuse to go further if the socket path will not fit in `sockaddr_un`.
+///
+/// Binding would otherwise fail with a message about `SUN_LEN` that says
+/// nothing about what to do, and in the daemon it would not be seen at all
+/// because stdio is already `/dev/null` by then.
+fn check_socket_path_fits(socket_path: &Path) -> Result<()> {
+    let len = socket_path.as_os_str().as_bytes().len();
+    if len <= MAX_SOCKET_PATH_LEN {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "Socket path is {len} bytes but this platform allows {MAX_SOCKET_PATH_LEN}: \
+         {socket_path:?}. Set $XDG_RUNTIME_DIR or $RUNTIME_DIRECTORY to a shorter \
+         directory, for example $HOME/.tmux-ssh-agent."
+    );
 }
 
 /// Block until the listener has a connection ready or the poll times out.

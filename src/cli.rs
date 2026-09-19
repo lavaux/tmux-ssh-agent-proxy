@@ -92,6 +92,15 @@ fn cmd_proxy(args: &[String]) -> Result<()> {
         anyhow::bail!("Not running under tmux server");
     }
 
+    // Check that tmux is actually reachable while stderr still goes somewhere
+    // the user will see it. Once we daemonise, stdio is /dev/null and any
+    // failure here would be completely silent.
+    match crate::tmux::probe() {
+        Ok(true) => {}
+        Ok(false) => anyhow::bail!("tmux is installed but its server did not respond"),
+        Err(e) => anyhow::bail!("{e}"),
+    }
+
     if args.contains(&"--no-daemon".to_string()) {
         let agent = ProxyAgent::new()?;
         agent.run(None)
@@ -116,6 +125,13 @@ fn start_daemonized_proxy() -> Result<()> {
             std::process::exit(if ok { 0 } else { 1 });
         }
         // First child: create new session, then double-fork to fully detach.
+        //
+        // Nothing between here and the daemon's main loop may call into the
+        // higher-level system libraries. Darwin aborts a forked-but-not-exec'd
+        // process that touches CoreFoundation, the Objective-C runtime or
+        // Directory Services, so no getpwuid, no getaddrinfo, no NSUserName.
+        // The syscalls used below (setsid, fork, fcntl, open, dup2, getuid) and
+        // plain file I/O are all safe; Command::new is safe because it execs.
         ForkResult::Child => {
             drop(read_end);
 

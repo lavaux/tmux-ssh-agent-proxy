@@ -6,11 +6,16 @@
 //! pane, so a request from one machine's pane can be signed by another
 //! machine's agent.
 //!
-//! This module answers the question properly. `SO_PEERCRED` gives the pid on
-//! the other end of the socket; walking that pid up the process tree until it
-//! meets a pane's process identifies the pane, and therefore the session, the
-//! request actually came from. Clients attached to that session are then the
-//! only candidates.
+//! This module answers the question properly. The kernel reports the pid on the
+//! other end of the socket; walking that pid up the process tree until it meets
+//! a pane's process identifies the pane, and therefore the session, the request
+//! actually came from. Clients attached to that session are then the only
+//! candidates.
+//!
+//! Both steps are platform specific. Linux reads peer credentials with
+//! `SO_PEERCRED` and parents from `/proc`; Darwin uses `LOCAL_PEERPID` plus
+//! `getpeereid(3)`, and libproc for parents. Everything between and above those
+//! two primitives is shared.
 //!
 //! Every step can fail (the peer may not be inside tmux at all), and the caller
 //! falls back to the server-wide heuristic when it does.
@@ -21,7 +26,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Give up walking the process tree after this many steps. The tree is a tree,
-/// so this is belt and braces against a malformed `/proc`.
+/// so this is belt and braces against the kernel reporting something absurd.
 const MAX_ANCESTRY_DEPTH: usize = 64;
 
 /// How long a pane listing stays usable before it is re-read.
@@ -63,6 +68,7 @@ fn peer_pid(stream: &UnixStream) -> Option<i32> {
     peer_credentials(stream).map(|(pid, _)| pid)
 }
 
+/// Linux hands back the pid, uid and gid together in one `SO_PEERCRED` call.
 #[cfg(target_os = "linux")]
 fn peer_credentials(stream: &UnixStream) -> Option<(i32, u32)> {
     use nix::sys::socket::{getsockopt, sockopt::PeerCredentials};
@@ -71,9 +77,25 @@ fn peer_credentials(stream: &UnixStream) -> Option<(i32, u32)> {
     Some((cred.pid(), cred.uid()))
 }
 
+/// Darwin has no `SO_PEERCRED`, and its `LOCAL_PEERCRED` yields an `xucred`
+/// carrying the uid but no pid, so the two halves come from separate calls.
+///
+/// The uid comes from `getpeereid(3)` rather than `LOCAL_PEERCRED` because it
+/// returns the uid directly. nix's `XuCred::groups()` ignores `cr_ngroups` and
+/// hands back all 16 array slots including the unset ones, which is a trap not
+/// worth stepping near when the uid is all that is wanted.
+#[cfg(target_vendor = "apple")]
+fn peer_credentials(stream: &UnixStream) -> Option<(i32, u32)> {
+    use nix::sys::socket::{getsockopt, sockopt::LocalPeerPid};
+
+    let pid = getsockopt(stream, LocalPeerPid).ok()?;
+    let (uid, _gid) = nix::unistd::getpeereid(stream).ok()?;
+    Some((pid, uid.as_raw()))
+}
+
 /// Other unices expose peer credentials differently (or not at all), so the
 /// caller falls back to the server-wide heuristic there.
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 fn peer_credentials(_stream: &UnixStream) -> Option<(i32, u32)> {
     None
 }
@@ -89,7 +111,7 @@ fn ancestry(pid: i32) -> Vec<i32> {
         }
         out.push(current);
         match parent_of(current) {
-            // A process cannot be its own parent; if /proc says otherwise, stop.
+            // A process cannot be its own parent; if the kernel says otherwise, stop.
             Some(parent) if parent != current => current = parent,
             _ => break,
         }
@@ -105,7 +127,46 @@ fn parent_of(pid: i32) -> Option<i32> {
     parse_ppid(&stat)
 }
 
-#[cfg(not(target_os = "linux"))]
+/// Read a process's parent pid through libproc.
+///
+/// Darwin has no `/proc`. The sysctl route would want a `struct kinfo_proc`,
+/// which the `libc` crate does not define for Apple targets, so it would have
+/// to be hand-transcribed and kept in step with the SDK. `proc_pidinfo` is
+/// declared for Apple and needs no extra linking, because libproc is a stub
+/// inside libSystem.
+#[cfg(target_vendor = "apple")]
+fn parent_of(pid: i32) -> Option<i32> {
+    use nix::libc::{proc_bsdinfo, proc_pidinfo, PROC_PIDTBSDINFO};
+
+    let size = std::mem::size_of::<proc_bsdinfo>();
+
+    // SAFETY: `proc_bsdinfo` is a plain C struct of integers and byte arrays,
+    // so an all-zero value is a valid instance. `proc_pidinfo` writes at most
+    // the buffer size it is given, which is passed explicitly below.
+    let mut info: proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let written = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut proc_bsdinfo as *mut nix::libc::c_void,
+            size as nix::libc::c_int,
+        )
+    };
+
+    // libproc returns the number of bytes written, or 0 on failure. A short
+    // write means we did not get the struct we asked for, so trust nothing.
+    if written != size as nix::libc::c_int {
+        return None;
+    }
+
+    match info.pbi_ppid {
+        0 => None,
+        ppid => Some(ppid as i32),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
 fn parent_of(_pid: i32) -> Option<i32> {
     None
 }
@@ -115,6 +176,7 @@ fn parent_of(_pid: i32) -> Option<i32> {
 /// The second field is the executable name in parentheses and may itself
 /// contain spaces and parentheses, so the fixed-position fields are only
 /// reliable after the *last* `)`.
+#[cfg(target_os = "linux")]
 fn parse_ppid(stat: &str) -> Option<i32> {
     let close = stat.rfind(')')?;
     let mut fields = stat[close + 1..].split_whitespace();
@@ -162,6 +224,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn reads_the_parent_pid_from_a_stat_line() {
         let stat = "1819367 (cat) R 1819343 1819367 1819343 0 -1 4194304 503 0 0";
         assert_eq!(parse_ppid(stat), Some(1819343));
@@ -170,12 +233,14 @@ mod tests {
     /// The comm field is attacker-influenced: a process can name itself
     /// anything, including something with spaces and parentheses in it.
     #[test]
+    #[cfg(target_os = "linux")]
     fn a_process_name_containing_spaces_and_parens_does_not_confuse_the_parse() {
         let stat = "4242 (weird ) name (x) S 99 4242 99 0 -1 0 0";
         assert_eq!(parse_ppid(stat), Some(99));
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn malformed_stat_lines_yield_nothing() {
         assert_eq!(parse_ppid(""), None);
         assert_eq!(parse_ppid("no parens here"), None);
@@ -183,7 +248,10 @@ mod tests {
         assert_eq!(parse_ppid("123 (sh) S notanumber"), None);
     }
 
+    /// Requires a real `parent_of`, which exists on Linux and Apple targets.
+    /// Elsewhere `ancestry` deliberately stops at the process itself.
     #[test]
+    #[cfg(any(target_os = "linux", target_vendor = "apple"))]
     fn ancestry_starts_at_the_process_itself_and_climbs() {
         let me = std::process::id() as i32;
         let chain = ancestry(me);
