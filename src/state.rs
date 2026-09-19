@@ -19,10 +19,16 @@ pub struct State {
 }
 
 impl State {
-    /// Remove entries whose agent socket no longer exists on the filesystem.
-    /// Prevents stale registrations from accumulating.
+    /// Remove stale entries: agent sockets that no longer exist on the
+    /// filesystem, and keys that are "not a tty" (bogus value from running
+    /// the `tty` command outside a terminal).
     fn cleanup(&mut self) {
-        self.agents.retain(|_, path| Path::new(path).exists());
+        self.agents.retain(|key, path| {
+            if key == "not a tty" {
+                return false;
+            }
+            Path::new(path).exists()
+        });
         if let Some(ref default) = self.default_agent {
             if !Path::new(default).exists() {
                 self.default_agent = None;

@@ -477,21 +477,26 @@ fn cmd_list_agents() -> Result<()> {
 }
 
 /// Get the current TTY path.
-/// Prefers `$SSH_TTY` if set, otherwise runs the `tty` command.
-/// Returns "unknown" if neither yields a result.
+/// Checks `$SSH_TTY` first; if empty or unset, runs the `tty` command.
+/// Returns "unknown" if no TTY can be determined.
+/// Filters "not a tty" / empty from the `tty` command — these are never
+/// meaningful registration keys and pollute the agent listing.
 fn get_tty() -> String {
-    std::env::var("SSH_TTY").unwrap_or_else(|_| {
-        std::process::Command::new("tty")
-            .output()
-            .ok()
-            .and_then(|o| {
-                let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if s.is_empty() {
-                    None
-                } else {
-                    Some(s)
-                }
-            })
-            .unwrap_or_else(|| "unknown".to_string())
-    })
+    if let Ok(val) = std::env::var("SSH_TTY") {
+        if !val.is_empty() {
+            return val;
+        }
+    }
+    std::process::Command::new("tty")
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if s.is_empty() || s == "not a tty" {
+                None
+            } else {
+                Some(s)
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string())
 }
