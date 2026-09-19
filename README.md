@@ -96,6 +96,8 @@ tmux-ssh-agent register-default-agent --override
 | `uninstall [--shell]` | Remove config from `~/.tmux.conf` (and optionally shell profile) |
 | `register-agent [SSH_AUTH_SOCK]` | Register agent for current TTY (reads `SSH_AUTH_SOCK` or arg) |
 | `register-default-agent [--override] [SSH_AUTH_SOCK]` | Register fallback agent |
+| `remove-agent [TTY]` | Remove registration for given TTY (defaults to current) |
+| `clear-agents` | Remove all agent registrations and default |
 | `list-agents` / `list` | List all registered agents, mark current TTY with `*` |
 
 ## License

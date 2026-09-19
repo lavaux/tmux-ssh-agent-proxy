@@ -20,6 +20,8 @@ pub fn run() -> Result<()> {
         "install" => cmd_install(&args[2..]),
         "uninstall" => cmd_uninstall(&args[2..]),
         "list" | "list-agents" => cmd_list_agents(),
+        "remove-agent" => cmd_remove_agent(&args[2..]),
+        "clear-agents" => cmd_clear_agents(),
         _ => {
             print_usage();
             std::process::exit(1);
@@ -39,6 +41,8 @@ fn print_usage() {
     eprintln!("  {name} uninstall [--shell]");
     eprintln!("  {name} register-agent [SSH_AUTH_SOCK]");
     eprintln!("  {name} register-default-agent [--override] [SSH_AUTH_SOCK]");
+    eprintln!("  {name} remove-agent [TTY]");
+    eprintln!("  {name} clear-agents");
     eprintln!("  {name} list-agents");
 }
 
@@ -474,6 +478,34 @@ fn cmd_list_agents() -> Result<()> {
             println!("{} {}: {}", marker, client, agent);
         }
     })
+}
+
+/// Handle the `remove-agent` subcommand.
+/// Removes the registration for the given TTY, or current TTY if none specified.
+fn cmd_remove_agent(args: &[String]) -> Result<()> {
+    let tty = args.first().cloned().unwrap_or_else(get_tty);
+    let runtime_dir = StateFile::runtime_dir();
+    let state_file = StateFile::new(runtime_dir.join("state"));
+    let removed = state_file.with_lock(|state| state.agents.remove(&tty))?;
+    if removed.is_some() {
+        println!("Removed agent for {}", tty);
+    } else {
+        println!("No agent registered for {}", tty);
+    }
+    Ok(())
+}
+
+/// Handle the `clear-agents` subcommand.
+/// Removes all per-TTY agent registrations and the default agent.
+fn cmd_clear_agents() -> Result<()> {
+    let runtime_dir = StateFile::runtime_dir();
+    let state_file = StateFile::new(runtime_dir.join("state"));
+    state_file.with_lock(|state| {
+        state.agents.clear();
+        state.default_agent = None;
+    })?;
+    println!("Cleared all agent registrations");
+    Ok(())
 }
 
 /// Get the current TTY path.
