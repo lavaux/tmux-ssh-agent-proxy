@@ -55,7 +55,7 @@ fn cmd_proxy(args: &[String]) -> Result<()> {
     }
 
     if args.contains(&"--no-daemon".to_string()) {
-        let agent = ProxyAgent::new();
+        let agent = ProxyAgent::new()?;
         agent.run(None)
     } else {
         start_daemonized_proxy()
@@ -102,7 +102,7 @@ fn start_daemonized_proxy() -> Result<()> {
                     redirect_stdio().context("redirect stdio failed")?;
                     let write_fd = unsafe { OwnedFd::from_raw_fd(write_fd_raw) };
 
-                    let agent = ProxyAgent::new();
+                    let agent = ProxyAgent::new()?;
                     agent.run(Some(Box::new(move || {
                         let _ = nix::unistd::write(&write_fd, b"ok");
                     })))?;
@@ -429,9 +429,9 @@ fn cmd_register_agent(args: &[String]) -> Result<()> {
         .cloned()
         .or_else(|| std::env::var("SSH_AUTH_SOCK").ok())
         .ok_or_else(|| anyhow::anyhow!("No SSH_AUTH_SOCK specified"))?;
+    let agent = crate::ssh_agent::validate_agent_socket(&agent)?;
 
-    let runtime_dir = StateFile::runtime_dir();
-    let state_file = StateFile::new(runtime_dir.join("state"));
+    let state_file = StateFile::open_default()?;
     state_file.with_lock(|state| {
         state.agents.insert(tty, agent);
     })
@@ -445,14 +445,13 @@ fn cmd_register_default_agent(args: &[String]) -> Result<()> {
     let override_flag = args.contains(&"--override".to_string());
     let agent = args
         .iter()
-        .filter(|a| *a != "--override")
-        .next()
+        .find(|a| *a != "--override")
         .cloned()
         .or_else(|| std::env::var("SSH_AUTH_SOCK").ok())
         .ok_or_else(|| anyhow::anyhow!("No SSH_AUTH_SOCK specified"))?;
+    let agent = crate::ssh_agent::validate_agent_socket(&agent)?;
 
-    let runtime_dir = StateFile::runtime_dir();
-    let state_file = StateFile::new(runtime_dir.join("state"));
+    let state_file = StateFile::open_default()?;
     state_file.with_lock(|state| {
         if override_flag || state.default_agent.is_none() {
             state.default_agent = Some(agent);
@@ -465,8 +464,7 @@ fn cmd_register_default_agent(args: &[String]) -> Result<()> {
 /// The current TTY is marked with `*`.
 fn cmd_list_agents() -> Result<()> {
     let tty = get_tty();
-    let runtime_dir = StateFile::runtime_dir();
-    let state_file = StateFile::new(runtime_dir.join("state"));
+    let state_file = StateFile::open_default()?;
     state_file.with_lock(|state| {
         if let Some(ref default) = state.default_agent {
             println!("  default: {}", default);
@@ -484,8 +482,7 @@ fn cmd_list_agents() -> Result<()> {
 /// Removes the registration for the given TTY, or current TTY if none specified.
 fn cmd_remove_agent(args: &[String]) -> Result<()> {
     let tty = args.first().cloned().unwrap_or_else(get_tty);
-    let runtime_dir = StateFile::runtime_dir();
-    let state_file = StateFile::new(runtime_dir.join("state"));
+    let state_file = StateFile::open_default()?;
     let removed = state_file.with_lock(|state| state.agents.remove(&tty))?;
     if removed.is_some() {
         println!("Removed agent for {}", tty);
@@ -498,8 +495,7 @@ fn cmd_remove_agent(args: &[String]) -> Result<()> {
 /// Handle the `clear-agents` subcommand.
 /// Removes all per-TTY agent registrations and the default agent.
 fn cmd_clear_agents() -> Result<()> {
-    let runtime_dir = StateFile::runtime_dir();
-    let state_file = StateFile::new(runtime_dir.join("state"));
+    let state_file = StateFile::open_default()?;
     state_file.with_lock(|state| {
         state.agents.clear();
         state.default_agent = None;
