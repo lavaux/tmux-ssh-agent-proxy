@@ -92,6 +92,80 @@ fn parse_active_client(output: &str) -> Option<String> {
         .map(|(_, tty)| tty)
 }
 
+/// The variables tmux copies from an attaching client into the session
+/// environment (`update-environment`).
+///
+/// This matters because the session environment shadows the global one, so
+/// anything on this list cannot be controlled with `set-environment -g`.
+pub fn update_environment() -> Option<Vec<String>> {
+    let output = Command::new("tmux")
+        .args(["show-options", "-g", "update-environment"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(parse_update_environment(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Parse `show-options -g update-environment`, whose lines look like
+/// `update-environment[0] DISPLAY`.
+fn parse_update_environment(output: &str) -> Vec<String> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (_option, value) = line.split_once(' ')?;
+            let value = value.trim().trim_matches('"');
+            if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        })
+        .collect()
+}
+
+/// Replace `update-environment` wholesale. tmux splits a space-separated value
+/// back into array elements.
+pub fn set_update_environment(vars: &[String]) -> Result<()> {
+    let status = Command::new("tmux")
+        .args(["set-option", "-g", "update-environment", &vars.join(" ")])
+        .status()
+        .with_context(|| "Failed to execute tmux set-option")?;
+    if !status.success() {
+        anyhow::bail!("tmux set-option update-environment failed");
+    }
+    Ok(())
+}
+
+/// Names of all sessions on the server.
+pub fn sessions() -> Option<Vec<String>> {
+    let output = Command::new("tmux")
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .collect(),
+    )
+}
+
+/// Remove a variable from one session's environment, so the global value shows
+/// through again. Failure is not interesting: usually it just was not set.
+pub fn unset_session_environment(session: &str, name: &str) {
+    let _ = Command::new("tmux")
+        .args(["set-environment", "-u", "-t", &format!("={session}"), name])
+        .status();
+}
+
 /// Map each pane's process to the session it belongs to, via
 /// `tmux list-panes -a`.
 ///
@@ -154,7 +228,7 @@ pub fn active_client_in_session(session: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_active_client, parse_pane_sessions};
+    use super::{parse_active_client, parse_pane_sessions, parse_update_environment};
 
     #[test]
     fn picks_the_most_recently_active_client() {
@@ -174,6 +248,23 @@ mod tests {
     fn no_attached_clients_yields_none() {
         assert_eq!(parse_active_client(""), None);
         assert_eq!(parse_active_client("\n"), None);
+    }
+
+    #[test]
+    fn parses_the_update_environment_array() {
+        let out = "update-environment[0] DISPLAY\n\
+                   update-environment[1] SSH_AUTH_SOCK\n\
+                   update-environment[2] XAUTHORITY\n";
+        assert_eq!(
+            parse_update_environment(out),
+            vec!["DISPLAY", "SSH_AUTH_SOCK", "XAUTHORITY"]
+        );
+    }
+
+    #[test]
+    fn an_empty_update_environment_parses_to_nothing() {
+        assert!(parse_update_environment("").is_empty());
+        assert!(parse_update_environment("update-environment[0] \n").is_empty());
     }
 
     #[test]

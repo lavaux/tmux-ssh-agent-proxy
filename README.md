@@ -8,6 +8,19 @@ When you launch tmux, the proxy starts a forwarding Unix socket and sets `SSH_AU
 
 This lets you attach to tmux from different machines, each with its own SSH agent, and have SSH work in every pane without a stale socket or a "wrong agent" error.
 
+### What the proxy changes in your tmux server
+
+Publishing `SSH_AUTH_SOCK` in the tmux global environment is not enough on its own. tmux has an `update-environment` option listing variables it copies from the attaching client into the *session* environment on every `new-session` and every `attach`, and the session environment shadows the global one. `SSH_AUTH_SOCK` is on that list by default, so the proxy would set its socket and tmux would immediately hide it behind whatever agent your login shell had.
+
+So at startup the proxy also:
+
+- removes `SSH_AUTH_SOCK` from `update-environment`, so no later attach re-shadows it, and
+- clears any `SSH_AUTH_SOCK` already set in existing sessions' environments.
+
+Both are global options, which live only as long as the tmux server, which is also the proxy's lifetime. Nothing is written to your configuration files. Every other variable in `update-environment`, such as `DISPLAY` and `XAUTHORITY`, keeps being refreshed as normal.
+
+The consequence worth knowing: while this is in effect, tmux stops refreshing `SSH_AUTH_SOCK` on reattach, because the proxy owns that variable instead. If the proxy is not running, panes will not get an agent socket from tmux.
+
 ### Which agent gets picked
 
 First the proxy works out which tmux client the request belongs to:
@@ -180,6 +193,9 @@ The path is checked before it is stored. A stale `$SSH_AUTH_SOCK` from a dead ag
 
 **The proxy refuses to start, citing the runtime directory.**
 Something else owns that directory, or it is a symlink. On a shared machine with the `/tmp` fallback, that is worth looking into before working around it.
+
+**`echo $SSH_AUTH_SOCK` in a pane does not point at the proxy.**
+Compare `tmux show-environment -g SSH_AUTH_SOCK` with `tmux show-environment SSH_AUTH_SOCK`. If the global one names the proxy socket and the session one names something else, the session environment is shadowing it, which is what the `update-environment` handling above exists to prevent. Check the proxy is actually running, and note that panes started before it will keep the environment they were created with.
 
 **Nothing happens when tmux starts.**
 Run `tmux-ssh-agent proxy --no-daemon` from inside tmux to see errors directly. The daemon sends its output to `/dev/null`.

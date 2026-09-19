@@ -234,6 +234,7 @@ impl ProxyAgent {
         listener.set_nonblocking(true)?;
 
         tmux::set_environment("SSH_AUTH_SOCK", &socket_path.to_string_lossy())?;
+        claim_environment("SSH_AUTH_SOCK")?;
 
         if let Some(f) = ready {
             f();
@@ -293,6 +294,40 @@ impl ProxyAgent {
 
         Ok(())
     }
+}
+
+/// Stop tmux from overwriting the variable we just set.
+///
+/// Setting the global environment is not enough on its own. tmux's
+/// `update-environment` option copies a list of variables from the attaching
+/// client into the *session* environment on every new-session and every
+/// attach, and the session environment shadows the global one.
+/// `SSH_AUTH_SOCK` is on that list by default, so the proxy would publish its
+/// socket and tmux would immediately hide it behind the client's own agent.
+/// That is the exact problem this tool exists to solve, so it has to be dealt
+/// with rather than assumed away.
+///
+/// Two steps: drop the variable from `update-environment` so no future attach
+/// re-shadows it, and clear the stale copy from sessions that already have one,
+/// which removing it from the list does not do.
+///
+/// This only touches a global option, which lives exactly as long as the tmux
+/// server does, and so does this daemon. It is not a lasting edit to the user's
+/// configuration.
+fn claim_environment(name: &str) -> Result<()> {
+    if let Some(vars) = tmux::update_environment() {
+        if vars.iter().any(|v| v == name) {
+            let kept: Vec<String> = vars.into_iter().filter(|v| v != name).collect();
+            tmux::set_update_environment(&kept)
+                .with_context(|| format!("Failed to take {name} out of update-environment"))?;
+        }
+    }
+
+    for session in tmux::sessions().unwrap_or_default() {
+        tmux::unset_session_environment(&session, name);
+    }
+
+    Ok(())
 }
 
 /// Refuse to go further if the socket path will not fit in `sockaddr_un`.

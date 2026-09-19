@@ -75,6 +75,10 @@ if cargo build >/dev/null 2>&1; then ok "cargo build"; else bad "cargo build"; e
 if cargo test >/dev/null 2>&1; then ok "cargo test"; else bad "cargo test (run 'cargo test' to see why)"; fi
 
 head_ "2. Daemon starts"
+# A decoy in the client environment: if tmux shadows the proxy with the
+# client's own SSH_AUTH_SOCK, the pane check below will see this instead.
+DECOY="$T/decoy.sock"
+export SSH_AUTH_SOCK="$DECOY"
 tmux -L smoke kill-server 2>/dev/null; sleep 0.3
 tmux -L smoke -f /dev/null new-session -d -s s1 bash
 # BSD script takes the command as trailing arguments, unlike Linux's -c form.
@@ -119,14 +123,32 @@ check_mode "$RT" 700 "runtime dir"
 [ -n "$SOCK" ] && check_mode "$SOCK" 600 "socket"
 check_mode "$RT/state" 600 "state file"
 
-head_ "5. Agent forwarding"
+head_ "5. Pane environment"
+# The check that matters, and the one this suite used to miss: not what the
+# daemon wrote to the global environment, but what a shell in a pane actually
+# inherits. tmux's update-environment copies SSH_AUTH_SOCK from the attaching
+# client into the session environment, where it shadows the global value, so a
+# decoy is planted in the client environment above to make shadowing visible.
+rm -f "$T/paneenv"
+tmux -L smoke new-window -t s1 -d "echo \"\$SSH_AUTH_SOCK\" > $T/paneenv; sleep 5"
+sleep 2
+PANE_SOCK=$(head -1 "$T/paneenv" 2>/dev/null)
+if [ -n "$SOCK" ] && [ "$PANE_SOCK" = "$SOCK" ]; then
+  ok "a new pane inherits the proxy socket"
+elif [ "$PANE_SOCK" = "$DECOY" ]; then
+  bad "pane still has the client's own agent: update-environment is shadowing the proxy"
+else
+  bad "pane has '${PANE_SOCK:-nothing}', expected $SOCK"
+fi
+
+head_ "6. Agent forwarding"
 if [ -n "$SOCK" ] && SSH_AUTH_SOCK="$SOCK" ssh-add -l 2>/dev/null | grep -q KEY1; then
   ok "ssh-add -l through the proxy lists the registered key"
 else
   bad "ssh-add -l through the proxy did not list the key"
 fi
 
-head_ "6. Per-pane routing (the parity test)"
+head_ "7. Per-pane routing (the parity test)"
 tmux -L smoke -f /dev/null new-session -d -s s2 bash
 script -q /dev/null tmux -L smoke attach -t s2 >/dev/null 2>&1 &
 sleep 2
@@ -155,14 +177,14 @@ else
   bad "unexpected result; see $T/out.s1 and $T/out.s2"
 fi
 
-head_ "7. Fallback from outside any pane"
+head_ "8. Fallback from outside any pane"
 if [ -n "$SOCK" ] && SSH_AUTH_SOCK="$SOCK" ssh-add -l 2>/dev/null | grep -q 'KEY[0-9]'; then
   ok "a request from outside tmux still resolves an agent"
 else
   bad "fallback path returned no agent"
 fi
 
-head_ "8. Shutdown is clean"
+head_ "9. Shutdown is clean"
 for p in $(our_daemons); do kill -TERM "$p" 2>/dev/null; done
 sleep 5
 [ "$(our_daemon_count)" = "0" ] && ok "daemon exited" || bad "daemon still running"
