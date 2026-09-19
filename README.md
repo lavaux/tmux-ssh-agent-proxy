@@ -10,13 +10,18 @@ This lets you attach to tmux from different machines, each with its own SSH agen
 
 ### Which agent gets picked
 
-In order:
+First the proxy works out which tmux client the request belongs to:
 
-1. If a tmux client is active and its TTY has a registered agent, that agent is used.
-2. If a tmux client is active and its TTY has no registration, the default agent is used, if one is set.
-3. If no tmux client is active, no agent is returned. There is nothing to identify the caller by, and falling back to the default here would mean handing keys to whichever agent happened to be registered last.
+1. It asks the socket for the pid on the other end (`SO_PEERCRED`), walks that process up the tree until it reaches a tmux pane process, and takes that pane's session. The agent is then chosen from the clients attached to that session. This is what makes several attached clients work: a request from a pane is answered by that pane's client, whoever typed most recently elsewhere.
+2. If the peer cannot be placed in a pane, for instance because it is not running under tmux at all, it falls back to the most recently active client on the server.
 
-Known limitation: "active client" means the most recently active client on the whole tmux server, not the client that owns the pane the request came from. With a single client attached this is exact. With several attached at once, whichever one you typed in most recently wins for every pane. Routing per pane requires identifying the connecting process, which is not yet implemented.
+Then, given that client's TTY:
+
+1. If the TTY has a registered agent, that agent is used.
+2. Otherwise the default agent is used, if one is set.
+3. If no tmux client could be identified at all, no agent is returned. There is nothing to identify the caller by, and falling back to the default here would mean handing keys to whichever agent happened to be registered last.
+
+Step 1 of the first list needs `SO_PEERCRED` and `/proc`, so it is Linux-only. On other unix systems the proxy uses the fallback, which is exact as long as one client is attached.
 
 ## Security
 
@@ -28,6 +33,7 @@ So the proxy keeps everything owner-only:
 - The socket is `0600`, and the daemon sets its umask to `0077` before binding.
 - The state file is `0600`.
 - A registered agent path must be an existing socket owned by you. This is checked when you register it and again before the proxy connects to it.
+- Connections from another uid are refused outright, rather than relying on the socket mode alone.
 
 The runtime directory is, in order of preference:
 
@@ -37,7 +43,7 @@ The runtime directory is, in order of preference:
 
 It holds the proxy socket, the `state` file mapping TTYs to agents, and `proxy.lock`.
 
-Developed and tested on Linux. It should work on other unix systems, with one caveat: the accept loop assumes an accepted socket does not inherit the listener's non-blocking flag. That holds on Linux; on the BSDs it does not, so the proxy sets the accepted socket back to blocking explicitly.
+Developed and tested on Linux. It builds and runs on other unix systems, with two caveats: per-pane routing needs `SO_PEERCRED` and `/proc`, so elsewhere the proxy uses the server-wide fallback described above; and the accept loop assumes an accepted socket does not inherit the listener's non-blocking flag, which holds on Linux but not on the BSDs, so the proxy sets it back to blocking explicitly.
 
 ## Build
 
@@ -143,6 +149,9 @@ Sets the fallback described under "Which agent gets picked". Use `--override` to
 
 **`ssh-add -l` says the agent has no identities, or cannot connect.**
 Check `tmux-ssh-agent list-agents`. If the list is empty, nothing registered: confirm `$SSH_AUTH_SOCK` was set when your login shell ran the registration snippet. If no tmux client is attached, no agent is returned by design.
+
+**A pane is using the wrong agent.**
+`list-agents` marks the current TTY with `*`. A pane is routed by the session it belongs to, so check that the client attached to that session is the one whose TTY you registered. A process that detached itself from the pane's process tree, such as something started with `setsid`, cannot be traced back to a pane and falls back to the most recently active client.
 
 **Registration fails with "is not a socket" or "does not exist".**
 The path is checked before it is stored. A stale `$SSH_AUTH_SOCK` from a dead agent gives this.

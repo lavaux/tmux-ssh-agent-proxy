@@ -1,6 +1,7 @@
 mod cli;
 mod config_edit;
 mod proxy;
+mod routing;
 mod ssh_agent;
 mod state;
 mod tmux;

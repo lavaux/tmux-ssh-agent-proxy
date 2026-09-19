@@ -1,3 +1,4 @@
+use crate::routing;
 use crate::ssh_agent;
 use crate::state::StateFile;
 use crate::tmux;
@@ -292,7 +293,17 @@ fn serve_client(mut downstream: UnixStream, state_file: &StateFile) {
     }
     let _ = downstream.set_write_timeout(Some(WRITE_TIMEOUT));
 
-    let agent_path = match get_agent_for_client(state_file) {
+    // The socket is 0600, so this should be unreachable. Check anyway: the
+    // whole point of this process is to decide who may use the user's keys,
+    // and that decision should not rest on a file mode alone.
+    if let Some(uid) = routing::peer_uid(&downstream) {
+        if uid != nix::unistd::getuid().as_raw() {
+            eprintln!("refusing connection from uid {uid}");
+            return;
+        }
+    }
+
+    let agent_path = match get_agent_for_client(state_file, &downstream) {
         Some(p) => p,
         None => return,
     };
@@ -336,14 +347,27 @@ fn serve_client(mut downstream: UnixStream, state_file: &StateFile) {
     }
 }
 
+/// Identify the tmux client this connection belongs to.
+///
+/// Prefers the pane the connecting process actually sits in, which is the only
+/// answer that is correct with more than one client attached. Falls back to the
+/// most recently active client server-wide when the peer cannot be placed, for
+/// instance when it is not running under tmux at all.
+fn resolve_client_tty(downstream: &UnixStream) -> Option<String> {
+    if let Some(tty) = routing::client_tty_for_peer(downstream) {
+        return Some(tty);
+    }
+    tmux::current_client()
+}
+
 /// Look up the agent socket path for the currently active tmux client.
 /// First checks per-TTY registration, then falls back to the default agent.
 /// Returns `None` if no agent is registered and no default is set.
-fn get_agent_for_client(state_file: &StateFile) -> Option<String> {
+fn get_agent_for_client(state_file: &StateFile, downstream: &UnixStream) -> Option<String> {
     // Resolve the client before taking the lock: this forks a tmux process, and
     // doing that under the lock would serialise every concurrent handler behind
     // a fork/exec.
-    let tty = tmux::current_client();
+    let tty = resolve_client_tty(downstream);
 
     state_file
         .with_lock_read(|state| match tty {
