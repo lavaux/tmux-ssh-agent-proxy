@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use std::process::Command;
 
+/// Check whether the tmux server is still alive.
+/// Returns `false` when tmux has exited or is unreachable.
 pub fn ping() -> bool {
     Command::new("tmux")
         .args(["display-message", "-p", "1"])
@@ -9,6 +11,7 @@ pub fn ping() -> bool {
         .unwrap_or(false)
 }
 
+/// Set a global tmux environment variable (`tmux set-environment -g`).
 pub fn set_environment(name: &str, value: &str) -> Result<()> {
     let status = Command::new("tmux")
         .args(["set-environment", "-g", name, value])
@@ -20,6 +23,9 @@ pub fn set_environment(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Return the TTY of the most recently active tmux client, if any.
+/// Parses `tmux list-client -F '#{client_activity}:#{client_tty}'`
+/// and picks the client with the highest activity timestamp.
 pub fn current_client() -> Option<String> {
     let output = Command::new("tmux")
         .args(["list-client", "-F", "#{client_activity}:#{client_tty}"])

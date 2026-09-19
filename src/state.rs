@@ -7,15 +7,20 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 
+/// Persistent state: maps TTY to agent socket path, plus optional default.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct State {
+    /// Per-TTY agent sockets. Key is TTY path (e.g. /dev/pts/0), value is SSH agent socket path.
     #[serde(default)]
     pub agents: HashMap<String, String>,
+    /// Fallback agent used when no per-TTY agent is registered.
     #[serde(default)]
     pub default_agent: Option<String>,
 }
 
 impl State {
+    /// Remove entries whose agent socket no longer exists on the filesystem.
+    /// Prevents stale registrations from accumulating.
     fn cleanup(&mut self) {
         self.agents.retain(|_, path| Path::new(path).exists());
         if let Some(ref default) = self.default_agent {
@@ -26,15 +31,20 @@ impl State {
     }
 }
 
+/// File-backed state store with exclusive flock(2) locking.
+/// Thread-safe across processes — only one writer at a time.
 pub struct StateFile {
     path: PathBuf,
 }
 
 impl StateFile {
+    /// Create a state file handle for the given path.
     pub fn new(path: PathBuf) -> Self {
         Self { path }
     }
 
+    /// Resolve the runtime directory (created if missing).
+    /// Priority: `$RUNTIME_DIRECTORY` > `$XDG_RUNTIME_DIR/tmux-ssh-agent-proxy` > `/tmp/tmux-ssh-agent-proxy-{uid}`.
     pub fn runtime_dir() -> PathBuf {
         if let Some(dir) = std::env::var_os("RUNTIME_DIRECTORY") {
             return PathBuf::from(dir);
@@ -50,6 +60,9 @@ impl StateFile {
         dir
     }
 
+    /// Acquire an exclusive lock on the state file, read+parse it, run `f`
+    /// on the mutable `State`, then write the result back atomically.
+    /// The lock is released when the method returns (file closed on drop).
     pub fn with_lock<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&mut State) -> T,
