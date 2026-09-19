@@ -38,3 +38,29 @@ jobs:
 
       - name: Build
         run: cargo build --all-targets
+
+  # Typechecks the macOS code paths without needing a Mac: clippy does not
+  # link, so no Apple SDK is involved. This is what catches a cfg branch that
+  # stops compiling, which is exactly how macOS support regressed before.
+  #
+  # It cannot catch runtime behaviour. Real macOS coverage would need a
+  # self-hosted runner, because Forgejo's fleet is Linux containers and Apple's
+  # licence forbids running macOS on non-Apple hardware. If one is ever added,
+  # make sure $TMPDIR there is the real per-user /var/folders path: a short
+  # TMPDIR would hide the socket-path-length class of bug entirely.
+  macos-cross-check:
+    runs-on: docker
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Lints for ${{ matrix.target }}
+        run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings

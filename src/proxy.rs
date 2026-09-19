@@ -429,3 +429,59 @@ fn get_agent_for_client(state_file: &StateFile, downstream: &UnixStream) -> Opti
         })
         .ok()?
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A representative macOS `$TMPDIR`: per-user, created by
+    /// `confstr(_CS_DARWIN_USER_TEMP_DIR)`, and 49 characters before anything
+    /// of ours is appended.
+    const DARWIN_TMPDIR: &str = "/var/folders/2z/_0y8k1zj0_35nfvq1n5jn4wm0000gn/T/";
+
+    fn socket_path_for(tmpdir: &str, uid: u32, name_bytes: usize) -> PathBuf {
+        PathBuf::from(tmpdir)
+            .join(format!("tmux-ssh-agent-proxy-{uid}"))
+            .join("a".repeat(name_bytes * 2))
+    }
+
+    /// The bug that stopped the daemon ever starting on macOS: the socket name
+    /// was 16 bytes of randomness as 32 hex characters, which put the path over
+    /// Darwin's 104-byte `sun_path` for every uid.
+    #[test]
+    fn socket_path_fits_darwins_limit_for_realistic_uids() {
+        // The check itself is compiled for this host, so assert against the
+        // Darwin number directly rather than MAX_SOCKET_PATH_LEN.
+        const DARWIN_MAX: usize = 103;
+
+        for uid in [0, 501, 1000, 502_364] {
+            let path = socket_path_for(DARWIN_TMPDIR, uid, SOCKET_NAME_BYTES);
+            let len = path.as_os_str().len();
+            assert!(
+                len <= DARWIN_MAX,
+                "uid {uid}: socket path is {len} bytes, over Darwin's {DARWIN_MAX}: {path:?}"
+            );
+
+            // And confirm the old size really was the problem, so nobody
+            // "tidies" the name back up to 16 bytes.
+            let old = socket_path_for(DARWIN_TMPDIR, uid, 16);
+            assert!(
+                old.as_os_str().len() > DARWIN_MAX,
+                "uid {uid}: 16 random bytes should not fit; this test is no longer meaningful"
+            );
+        }
+    }
+
+    #[test]
+    fn an_over_long_socket_path_is_refused_with_advice() {
+        let path = PathBuf::from("/x".repeat(MAX_SOCKET_PATH_LEN));
+        let err = check_socket_path_fits(&path).expect_err("must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("XDG_RUNTIME_DIR"), "unhelpful message: {msg}");
+    }
+
+    #[test]
+    fn a_path_within_the_limit_is_accepted() {
+        assert!(check_socket_path_fits(&socket_path_for("/tmp/", 1000, SOCKET_NAME_BYTES)).is_ok());
+    }
+}

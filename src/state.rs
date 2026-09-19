@@ -253,17 +253,25 @@ fn validate_runtime_dir(dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    /// Serialises tests that change process-global state.
+    static GLOBAL_STATE: Mutex<()> = Mutex::new(());
 
     /// A scratch directory that cleans itself up.
+    ///
+    /// The name is kept short on purpose. These directories hold bound Unix
+    /// sockets, and on macOS `std::env::temp_dir()` is the per-user
+    /// `/var/folders/...` path of about 49 characters, leaving little of the
+    /// 104-byte `sun_path` budget for anything else.
     struct TempDir(PathBuf);
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "tsa-test-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
+            static COUNTER: AtomicUsize = AtomicUsize::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("tsa{}-{tag}{n}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).expect("temp dir");
             Self(dir)
@@ -285,7 +293,7 @@ mod tests {
 
     #[test]
     fn round_trips_a_registration() {
-        let dir = TempDir::new("roundtrip");
+        let dir = TempDir::new("rt");
         let sock = dir.path().join("agent.sock");
         let _listener = UnixListener::bind(&sock).expect("bind");
         let sf = state_file(&dir);
@@ -304,7 +312,9 @@ mod tests {
 
     #[test]
     fn state_file_is_created_private() {
-        let dir = TempDir::new("mode");
+        let _guard = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = TempDir::new("md");
         let sf = state_file(&dir);
         sf.with_lock(|_| {}).expect("write");
 
@@ -314,7 +324,9 @@ mod tests {
 
     #[test]
     fn a_state_file_left_world_readable_is_tightened() {
-        let dir = TempDir::new("tighten");
+        let _guard = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = TempDir::new("tg");
         let path = dir.path().join("state");
         fs::write(&path, "{}").expect("seed");
         fs::set_permissions(&path, Permissions::from_mode(0o644)).expect("chmod");
@@ -328,7 +340,7 @@ mod tests {
 
     #[test]
     fn cleanup_drops_agents_whose_socket_is_gone() {
-        let dir = TempDir::new("cleanup");
+        let dir = TempDir::new("cl");
         let live = dir.path().join("live.sock");
         let _listener = UnixListener::bind(&live).expect("bind");
 
@@ -363,7 +375,7 @@ mod tests {
     /// the empty state was written straight back.
     #[test]
     fn corrupt_state_does_not_abort_the_command() {
-        let dir = TempDir::new("corrupt");
+        let dir = TempDir::new("co");
         let path = dir.path().join("state");
         fs::write(&path, "{ this is not json").expect("seed");
 
@@ -374,7 +386,7 @@ mod tests {
 
     #[test]
     fn concurrent_writers_do_not_lose_entries() {
-        let dir = TempDir::new("concurrent");
+        let dir = TempDir::new("cc");
         let path = dir.path().join("state");
 
         // Real sockets, so cleanup does not drop them between writes.
@@ -410,7 +422,11 @@ mod tests {
 
     #[test]
     fn runtime_dir_is_created_private_even_under_a_lax_umask() {
-        let dir = TempDir::new("runtimedir");
+        // umask(2) is process-global, so this must not run while another test
+        // is creating a file and checking its mode.
+        let _guard = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = TempDir::new("rd");
         let target = dir.path().join("runtime");
 
         let old = nix::sys::stat::umask(nix::sys::stat::Mode::empty());
@@ -424,7 +440,7 @@ mod tests {
 
     #[test]
     fn an_existing_loose_runtime_dir_is_tightened() {
-        let dir = TempDir::new("loose");
+        let dir = TempDir::new("lo");
         let target = dir.path().join("runtime");
         fs::create_dir(&target).expect("mkdir");
         fs::set_permissions(&target, Permissions::from_mode(0o755)).expect("chmod");
@@ -439,7 +455,7 @@ mod tests {
 
     #[test]
     fn a_symlinked_runtime_dir_is_refused() {
-        let dir = TempDir::new("symlink");
+        let dir = TempDir::new("sl");
         let real = dir.path().join("real");
         fs::create_dir(&real).expect("mkdir");
         let link = dir.path().join("link");

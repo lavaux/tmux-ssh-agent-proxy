@@ -21,7 +21,7 @@ Then, given that client's TTY:
 2. Otherwise the default agent is used, if one is set.
 3. If no tmux client could be identified at all, no agent is returned. There is nothing to identify the caller by, and falling back to the default here would mean handing keys to whichever agent happened to be registered last.
 
-Step 1 of the first list needs `SO_PEERCRED` and `/proc`, so it is Linux-only. On other unix systems the proxy uses the fallback, which is exact as long as one client is attached.
+Step 1 of the first list is implemented on Linux (`SO_PEERCRED` plus `/proc`) and on macOS (`LOCAL_PEERPID`, `getpeereid(3)` and libproc). On other unix systems the proxy uses the fallback, which is exact as long as one client is attached.
 
 ## Security
 
@@ -33,7 +33,7 @@ So the proxy keeps everything owner-only:
 - The socket is `0600`, and the daemon sets its umask to `0077` before binding.
 - The state file is `0600`.
 - A registered agent path must be an existing socket owned by you. This is checked when you register it and again before the proxy connects to it.
-- Connections from another uid are refused outright, rather than relying on the socket mode alone.
+- Connections from another uid are refused outright, rather than relying on the socket mode alone. This check needs peer credentials from the kernel, so it applies on Linux and macOS; see Platforms below.
 
 The runtime directory is, in order of preference:
 
@@ -43,7 +43,29 @@ The runtime directory is, in order of preference:
 
 It holds the proxy socket, the `state` file mapping TTYs to agents, and `proxy.lock`.
 
-Developed and tested on Linux. It builds and runs on other unix systems, with two caveats: per-pane routing needs `SO_PEERCRED` and `/proc`, so elsewhere the proxy uses the server-wide fallback described above; and the accept loop assumes an accepted socket does not inherit the listener's non-blocking flag, which holds on Linux but not on the BSDs, so the proxy sets it back to blocking explicitly.
+## Platforms
+
+Linux and macOS are both supported, with per-pane routing on each. Other unix systems build and run, but fall back to the server-wide client heuristic, because neither `LOCAL_PEERPID` nor `/proc` is available to identify the connecting process.
+
+### macOS notes
+
+**Socket path length.** `sockaddr_un.sun_path` holds 104 bytes on Darwin against 108 on Linux, and macOS sets `$TMPDIR` to a per-user path of around 49 characters, so the budget is tighter than it looks. The proxy keeps its socket name short enough to fit and refuses to start with a clear message if the path would not. If you hit that, point `$XDG_RUNTIME_DIR` at something shorter:
+
+```sh
+export XDG_RUNTIME_DIR="$HOME/.tmux-ssh-agent"
+```
+
+`$TMPDIR` is used in preference to `/tmp` on macOS deliberately: it is per-user, already `0700`, and not guessable by another local user, so it is the safer of the two.
+
+**tmux on `$PATH`.** tmux comes from Homebrew, in `/opt/homebrew/bin` on Apple Silicon or `/usr/local/bin` on Intel. Neither is on the default `PATH` that a process started by launchd inherits. The proxy checks for tmux before it detaches and says so plainly if it cannot find it.
+
+**Canonical paths.** `/tmp` and `/var` are symlinks into `/private`, so a registered agent socket is stored and displayed in its resolved form. `list-agents` will show `/private/tmp/...` where you typed `/tmp/...`. This is cosmetic, but it also lengthens the path, which matters near the limit above.
+
+There is a runtime smoke test at `contrib/macos-smoke-test.sh` covering startup, permissions, forwarding, per-pane routing and shutdown.
+
+### Portability note
+
+The accept loop assumes an accepted socket does not inherit the listener's non-blocking flag. That holds on Linux but not on the BSDs, so the proxy sets it back to blocking explicitly.
 
 ## Build
 
