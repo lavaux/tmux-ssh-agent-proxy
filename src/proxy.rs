@@ -4,8 +4,10 @@ use crate::tmux;
 use anyhow::{Context, Result};
 use nix::sys::stat::{umask, Mode};
 use std::fs::Permissions;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -14,6 +16,68 @@ use std::time::Duration;
 /// permission on it, so anything looser hands the upstream SSH agent to every
 /// local account.
 const SOCKET_MODE: u32 = 0o600;
+
+/// Set by the signal handler to ask the accept loop to shut down.
+static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// Signal handler. Only an atomic store, which is async-signal-safe.
+extern "C" fn handle_shutdown(_: nix::libc::c_int) {
+    SHUTDOWN.store(true, Ordering::SeqCst);
+}
+
+/// Ask for SIGTERM, SIGINT and SIGHUP to stop the accept loop rather than kill
+/// the process outright, so the socket file is unlinked on the way out.
+/// Deliberately installed without SA_RESTART: a pending accept should fail with
+/// EINTR so the loop notices the flag promptly.
+fn install_signal_handlers() -> Result<()> {
+    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+
+    let action = SigAction::new(
+        SigHandler::Handler(handle_shutdown),
+        SaFlags::empty(),
+        SigSet::empty(),
+    );
+    for sig in [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP] {
+        unsafe { sigaction(sig, &action) }
+            .with_context(|| format!("Failed to install handler for {sig:?}"))?;
+    }
+    Ok(())
+}
+
+/// Unlinks the proxy socket when the daemon stops, however it stops.
+///
+/// The previous code only unlinked after a normal loop exit, so an error on the
+/// way up, or any signal, left the socket behind for good.
+struct SocketGuard {
+    path: PathBuf,
+}
+
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Remove sockets in the runtime directory that no process is listening on.
+///
+/// Every abrupt termination before this release leaked one, and nothing ever
+/// collected them. A socket with a live daemon behind it accepts connections,
+/// so only the dead ones are removed.
+fn sweep_stale_sockets(runtime_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(runtime_dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.metadata() {
+            Ok(meta) if meta.file_type().is_socket() => {}
+            _ => continue,
+        }
+        if UnixStream::connect(&path).is_err() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
 
 /// Transparent SSH agent proxy that forwards requests from a local Unix socket
 /// to the upstream agent assigned to the currently active tmux client.
@@ -50,8 +114,15 @@ impl ProxyAgent {
             .collect();
         let socket_path = runtime_dir.join(hex);
 
+        sweep_stale_sockets(&runtime_dir);
+        install_signal_handlers()?;
+
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("Failed to bind {socket_path:?}"))?;
+        // From here on the socket file is removed however this function exits.
+        let _socket_guard = SocketGuard {
+            path: socket_path.clone(),
+        };
         // Belt and braces: the umask above already covers this, but set the
         // mode explicitly so the guarantee does not depend on it.
         std::fs::set_permissions(&socket_path, Permissions::from_mode(SOCKET_MODE))
@@ -65,6 +136,10 @@ impl ProxyAgent {
         }
 
         loop {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                break;
+            }
+
             if !tmux::ping() {
                 break;
             }
@@ -79,14 +154,14 @@ impl ProxyAgent {
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_secs(3));
                 }
+                // A signal arriving mid-accept is how shutdown reaches us.
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(e) => {
                     eprintln!("accept error: {}", e);
                     break;
                 }
             }
         }
-
-        let _ = std::fs::remove_file(&socket_path);
 
         Ok(())
     }

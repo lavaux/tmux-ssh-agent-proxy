@@ -201,9 +201,8 @@ fn ensure_runtime_dir(dir: &Path) -> Result<()> {
         Ok(()) => return Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => {
-            return Err(e).with_context(|| {
-                format!("Failed to create runtime directory {}", dir.display())
-            })
+            return Err(e)
+                .with_context(|| format!("Failed to create runtime directory {}", dir.display()))
         }
     }
     validate_runtime_dir(dir)

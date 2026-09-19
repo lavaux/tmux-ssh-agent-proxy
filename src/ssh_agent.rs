@@ -5,17 +5,36 @@ use std::os::unix::net::UnixStream;
 /// SSH_AGENT_FAILURE response code (first byte of a failure payload).
 pub const SSH_AGENT_FAILURE: u8 = 5;
 
+/// Largest agent message we will accept, matching OpenSSH's own limit.
+/// The length prefix is attacker controlled, so without a cap a four byte
+/// header can ask us to allocate 4 GiB.
+pub const MAX_PACKET_LEN: usize = 256 * 1024;
+
 /// Read one SSH agent protocol packet from `reader`.
 /// Format: 4-byte big-endian length prefix, then payload bytes.
 /// Returns `Ok(None)` on EOF (connection closed), `Ok(Some(payload))` on success.
 pub fn recv_packet<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
     let mut len_buf = [0u8; 4];
-    if reader.read_exact(&mut len_buf).is_err() {
-        return Ok(None);
+    match reader.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        // Only a clean EOF means "peer went away"; anything else is a real
+        // error and reporting it as EOF hides genuine failures.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e).context("Failed to read agent packet length"),
     }
+
     let len = u32::from_be_bytes(len_buf) as usize;
+    if len == 0 {
+        anyhow::bail!("Agent packet has zero length");
+    }
+    if len > MAX_PACKET_LEN {
+        anyhow::bail!("Agent packet of {len} bytes exceeds the {MAX_PACKET_LEN} byte limit");
+    }
+
     let mut payload = vec![0u8; len];
-    reader.read_exact(&mut payload)?;
+    reader
+        .read_exact(&mut payload)
+        .context("Failed to read agent packet payload")?;
     Ok(Some(payload))
 }
 

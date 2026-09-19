@@ -1,8 +1,11 @@
 use crate::proxy::ProxyAgent;
 use crate::state::StateFile;
 use anyhow::{Context, Result};
+use nix::errno::Errno;
+use nix::fcntl::{fcntl, FcntlArg};
+use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::{dup2, fork, pipe, setsid, ForkResult};
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 
 /// Parse CLI arguments and dispatch to the matching subcommand handler.
 /// Exits with code 1 on unknown subcommand or missing args.
@@ -68,21 +71,14 @@ fn cmd_proxy(args: &[String]) -> Result<()> {
 /// this and exits with code 0 on success, 1 on failure.
 fn start_daemonized_proxy() -> Result<()> {
     let (read_end, write_end) = pipe().context("pipe failed")?;
-    let write_fd_raw = write_end.as_raw_fd();
-    let read_fd_raw = read_end.as_raw_fd();
 
     match unsafe { fork().context("first fork failed")? } {
         // Original parent: wait for ready signal, then exit.
         ForkResult::Parent { .. } => {
             drop(write_end);
-            let _ = read_end.into_raw_fd();
-            let mut buf = [0u8; 2];
-            let n = nix::unistd::read(read_fd_raw, &mut buf).context("read ready signal")?;
-            nix::unistd::close(read_fd_raw)?;
-            if n == 2 && &buf == b"ok" {
-                std::process::exit(0);
-            }
-            std::process::exit(1);
+            let ok = read_ready_signal(read_end.as_raw_fd());
+            drop(read_end);
+            std::process::exit(if ok { 0 } else { 1 });
         }
         // First child: create new session, then double-fork to fully detach.
         ForkResult::Child => {
@@ -98,13 +94,18 @@ fn start_daemonized_proxy() -> Result<()> {
                 }
                 // Grandchild = actual daemon: redirect stdio, run proxy, signal ready.
                 ForkResult::Child => {
-                    drop(write_end);
+                    // `write_end` stays owned across redirect_stdio. Closing it
+                    // first would free its number for one of the /dev/null
+                    // opens below to take, and the ready signal would then be
+                    // written to /dev/null (or to a descriptor we do not own).
+                    // Move it above fd 2 so the dup2 calls cannot clobber it in
+                    // the rare case that stdio was already closed.
+                    let write_end = move_fd_above_stdio(write_end)?;
                     redirect_stdio().context("redirect stdio failed")?;
-                    let write_fd = unsafe { OwnedFd::from_raw_fd(write_fd_raw) };
 
                     let agent = ProxyAgent::new()?;
                     agent.run(Some(Box::new(move || {
-                        let _ = nix::unistd::write(&write_fd, b"ok");
+                        let _ = nix::unistd::write(&write_end, b"ok");
                     })))?;
 
                     std::process::exit(0);
@@ -114,12 +115,59 @@ fn start_daemonized_proxy() -> Result<()> {
     }
 }
 
+/// Read the two-byte ready signal, tolerating short reads and `EINTR`.
+/// Returns false on EOF (the daemon died before signalling), on error, or if
+/// the daemon does not answer within `READY_TIMEOUT_MS`.
+fn read_ready_signal(fd: std::os::unix::io::RawFd) -> bool {
+    const READY_TIMEOUT_MS: u16 = 10_000;
+
+    let mut buf = [0u8; 2];
+    let mut got = 0;
+
+    while got < buf.len() {
+        // Bound the wait so a daemon that wedges during startup cannot hang
+        // the shell (or tmux) that invoked us.
+        let borrowed = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) };
+        let mut fds = [PollFd::new(borrowed, PollFlags::POLLIN)];
+        match poll(&mut fds, PollTimeout::from(READY_TIMEOUT_MS)) {
+            Ok(0) => return false,
+            Ok(_) => {}
+            Err(Errno::EINTR) => continue,
+            Err(_) => return false,
+        }
+
+        match nix::unistd::read(fd, &mut buf[got..]) {
+            Ok(0) => return false,
+            Ok(n) => got += n,
+            Err(Errno::EINTR) => continue,
+            Err(_) => return false,
+        }
+    }
+
+    &buf == b"ok"
+}
+
+/// Move `fd` to a number above stderr so that redirecting stdio cannot
+/// overwrite it. Returns the original if it is already above fd 2.
+fn move_fd_above_stdio(fd: OwnedFd) -> Result<OwnedFd> {
+    if fd.as_raw_fd() > 2 {
+        return Ok(fd);
+    }
+    let moved = fcntl(fd.as_raw_fd(), FcntlArg::F_DUPFD_CLOEXEC(3)).context("F_DUPFD_CLOEXEC")?;
+    Ok(unsafe { OwnedFd::from_raw_fd(moved) })
+}
+
 /// Redirect stdin/stdout/stderr to /dev/null.
 /// Required for daemon processes to detach from the controlling terminal.
 fn redirect_stdio() -> Result<()> {
-    let devnull = std::fs::File::open("/dev/null").context("open /dev/null for stdin")?;
-    let devnull_out =
-        std::fs::File::create("/dev/null").context("open /dev/null for stdout/stderr")?;
+    let devnull = std::fs::OpenOptions::new()
+        .read(true)
+        .open("/dev/null")
+        .context("open /dev/null for stdin")?;
+    let devnull_out = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/null")
+        .context("open /dev/null for stdout/stderr")?;
 
     dup2(devnull.as_raw_fd(), 0).context("dup2 stdin")?;
     dup2(devnull_out.as_raw_fd(), 1).context("dup2 stdout")?;
@@ -423,7 +471,7 @@ fn uninstall_shell_profile() -> Result<()> {
 /// Registers the given agent socket (or `$SSH_AUTH_SOCK`) for the current TTY.
 /// Args: optional explicit socket path; env var `SSH_AUTH_SOCK` is used as fallback.
 fn cmd_register_agent(args: &[String]) -> Result<()> {
-    let tty = get_tty();
+    let tty = require_tty()?;
     let agent = args
         .first()
         .cloned()
@@ -464,6 +512,7 @@ fn cmd_register_default_agent(args: &[String]) -> Result<()> {
 /// The current TTY is marked with `*`.
 fn cmd_list_agents() -> Result<()> {
     let tty = get_tty();
+
     let state_file = StateFile::open_default()?;
     state_file.with_lock(|state| {
         if let Some(ref default) = state.default_agent {
@@ -472,7 +521,11 @@ fn cmd_list_agents() -> Result<()> {
         let mut agents: Vec<_> = state.agents.iter().collect();
         agents.sort_by(|a, b| a.0.cmp(b.0));
         for (client, agent) in agents {
-            let marker = if *client == tty { "*" } else { " " };
+            let marker = if Some(client.as_str()) == tty.as_deref() {
+                "*"
+            } else {
+                " "
+            };
             println!("{} {}: {}", marker, client, agent);
         }
     })
@@ -481,7 +534,10 @@ fn cmd_list_agents() -> Result<()> {
 /// Handle the `remove-agent` subcommand.
 /// Removes the registration for the given TTY, or current TTY if none specified.
 fn cmd_remove_agent(args: &[String]) -> Result<()> {
-    let tty = args.first().cloned().unwrap_or_else(get_tty);
+    let tty = match args.first() {
+        Some(t) => t.clone(),
+        None => require_tty()?,
+    };
     let state_file = StateFile::open_default()?;
     let removed = state_file.with_lock(|state| state.agents.remove(&tty))?;
     if removed.is_some() {
@@ -504,27 +560,30 @@ fn cmd_clear_agents() -> Result<()> {
     Ok(())
 }
 
-/// Get the current TTY path.
-/// Checks `$SSH_TTY` first; if empty or unset, runs the `tty` command.
-/// Returns "unknown" if no TTY can be determined.
-/// Filters "not a tty" / empty from the `tty` command — these are never
-/// meaningful registration keys and pollute the agent listing.
-fn get_tty() -> String {
+/// Get the current TTY path, if there is one.
+///
+/// Checks `$SSH_TTY` first, then asks the kernel via `ttyname(3)` on stdin.
+/// The previous implementation shelled out to `tty` and compared its output
+/// against the English string "not a tty", which does not match under any other
+/// locale, and fell back to the literal key "unknown" that every TTY-less
+/// session then shared.
+fn get_tty() -> Option<String> {
     if let Ok(val) = std::env::var("SSH_TTY") {
         if !val.is_empty() {
-            return val;
+            return Some(val);
         }
     }
-    std::process::Command::new("tty")
-        .output()
+    nix::unistd::ttyname(std::io::stdin())
         .ok()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() || s == "not a tty" {
-                None
-            } else {
-                Some(s)
-            }
-        })
-        .unwrap_or_else(|| "unknown".to_string())
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Get the current TTY path or fail with an actionable message.
+fn require_tty() -> Result<String> {
+    get_tty().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No TTY for this session, so there is nothing to register an agent against. \
+             Pass the TTY explicitly, or set $SSH_TTY."
+        )
+    })
 }
