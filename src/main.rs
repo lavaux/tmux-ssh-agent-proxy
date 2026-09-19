@@ -1,4 +1,5 @@
 mod cli;
+mod config_edit;
 mod proxy;
 mod ssh_agent;
 mod state;

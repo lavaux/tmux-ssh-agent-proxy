@@ -1,3 +1,4 @@
+use crate::config_edit::{self, Removal, Shell};
 use crate::proxy::ProxyAgent;
 use crate::state::StateFile;
 use anyhow::{Context, Result};
@@ -6,6 +7,7 @@ use nix::fcntl::{fcntl, FcntlArg};
 use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
 use nix::unistd::{dup2, fork, pipe, setsid, ForkResult};
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 
 /// Parse CLI arguments and dispatch to the matching subcommand handler.
 /// Exits with code 1 on unknown subcommand or missing args.
@@ -176,295 +178,163 @@ fn redirect_stdio() -> Result<()> {
     Ok(())
 }
 
+/// Shell profiles we know about, in the order we fall back through them.
+const PROFILE_CANDIDATES: [(&str, Shell); 3] = [
+    (".bashrc", Shell::Posix),
+    (".zshrc", Shell::Posix),
+    (".config/fish/config.fish", Shell::Fish),
+];
+
+/// The user's home directory.
+fn home() -> Result<PathBuf> {
+    Ok(PathBuf::from(
+        std::env::var("HOME").context("HOME not set")?,
+    ))
+}
+
+/// Pick the shell profile to edit, and the syntax it needs.
+///
+/// `$SHELL` decides, because picking the first file that happens to exist gives
+/// a zsh user with a leftover `.bashrc` a snippet their shell never reads.
+fn detect_profile() -> Result<(PathBuf, Shell)> {
+    let home = home()?;
+
+    if let Some(shell) = std::env::var_os("SHELL") {
+        let name = Path::new(&shell)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match name.as_str() {
+            "fish" => return Ok((home.join(".config/fish/config.fish"), Shell::Fish)),
+            "zsh" => return Ok((home.join(".zshrc"), Shell::Posix)),
+            "bash" | "sh" | "dash" | "ksh" => return Ok((home.join(".bashrc"), Shell::Posix)),
+            _ => {}
+        }
+    }
+
+    for (rel, shell) in PROFILE_CANDIDATES {
+        let path = home.join(rel);
+        if path.exists() {
+            return Ok((path, shell));
+        }
+    }
+
+    Ok((home.join(".bashrc"), Shell::Posix))
+}
+
 /// Handle the `install` subcommand.
-/// Adds `run 'tmux-ssh-agent proxy'` to `~/.tmux.conf` if not already present.
-/// Backs up the original file before modifying.
-/// With `--shell`, also adds the login registration snippet to `~/.bashrc`.
+/// Adds the proxy block to `~/.tmux.conf`, backing the file up first.
+/// With `--shell`, also adds the login registration snippet to the profile
+/// matching `$SHELL`.
 fn cmd_install(args: &[String]) -> Result<()> {
     let add_shell = args.contains(&"--shell".to_string());
 
-    install_tmux_config()?;
+    apply_install(&home()?.join(".tmux.conf"), &config_edit::tmux_snippet())?;
+
     if add_shell {
-        install_shell_profile()?;
+        let (path, shell) = detect_profile()?;
+        apply_install(&path, &config_edit::shell_snippet(shell))?;
     }
 
     println!("Install complete. Reload tmux: tmux source-file ~/.tmux.conf");
     if !add_shell {
         println!("To auto-register agents on login, run with --shell or add the snippet manually:");
-        println!("  if [ -z \"$TMUX\" ] && [ -n \"$SSH_AUTH_SOCK\" ]; then");
-        println!("    tmux-ssh-agent register-agent");
-        println!("  fi");
+        for line in config_edit::shell_snippet(detect_profile()?.1) {
+            println!("  {line}");
+        }
     }
     Ok(())
 }
 
-/// Add the `run 'tmux-ssh-agent proxy'` line to `~/.tmux.conf`.
-/// Creates the file if it doesn't exist, backs it up otherwise.
-fn install_tmux_config() -> Result<()> {
-    use std::io::{Read, Write};
-
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let path = std::path::PathBuf::from(home).join(".tmux.conf");
-    let line = "run 'tmux-ssh-agent proxy'";
-
-    let mut contents = String::new();
-    let exists = path.exists();
-
-    if exists {
-        let mut file = std::fs::File::open(&path)?;
-        file.read_to_string(&mut contents)?;
-
-        if contents.lines().any(|l| l.trim() == line) {
-            println!("Already present in {}: {}", path.display(), line);
-            return Ok(());
-        }
-
-        // Back up
-        let backup = path.with_extension("tmux.conf.bak");
-        std::fs::copy(&path, &backup)
-            .with_context(|| format!("Failed to back up {} to {:?}", path.display(), backup))?;
-        println!("Backed up {} -> {:?}", path.display(), backup);
-    }
-
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-
-    if !exists {
-        writeln!(file, "{}", line)?;
-    } else {
-        writeln!(file)?;
-        writeln!(file, "# Added by tmux-ssh-agent install")?;
-        writeln!(file, "{}", line)?;
-    }
-
-    println!("Added to {}: {}", path.display(), line);
-    Ok(())
-}
-
-/// Add the login registration snippet to `~/.bashrc`.
-/// Detects which shell config file exists (~/.bashrc > ~/.zshrc > ~/.config/fish/config.fish).
-fn install_shell_profile() -> Result<()> {
-    use std::io::{Read, Write};
-
-    let home = std::env::var("HOME").context("HOME not set")?;
-
-    let candidates = [".bashrc", ".zshrc", ".config/fish/config.fish"];
-
-    let mut profile = None;
-    for cand in &candidates {
-        let p = std::path::PathBuf::from(&home).join(cand);
-        if p.exists() {
-            profile = Some(p);
-            break;
-        }
-    }
-
-    let path = match profile {
-        Some(p) => p,
-        None => {
-            // Default to .bashrc
-            let p = std::path::PathBuf::from(&home).join(".bashrc");
-            std::fs::File::create(&p)?;
-            p
-        }
+/// Add our block to `path`, backing the file up first if it has content.
+fn apply_install(path: &Path, body: &[String]) -> Result<()> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("Failed to read {}", path.display())),
     };
 
-    let snippet_start = "# Added by tmux-ssh-agent install";
-    let snippet = format!(
-        "{}\nif [ -z \"$TMUX\" ] && [ -n \"$SSH_AUTH_SOCK\" ]; then\n  tmux-ssh-agent register-agent\nfi\n",
-        snippet_start
-    );
+    let Some(updated) = config_edit::add_block(&contents, body) else {
+        println!("Already present in {}", path.display());
+        return Ok(());
+    };
 
-    let mut contents = String::new();
-    if path.exists() {
-        let mut file = std::fs::File::open(&path)?;
-        file.read_to_string(&mut contents)?;
-
-        if contents.contains(snippet_start) {
-            println!(
-                "Already present in {}: registration snippet",
-                path.display()
-            );
-            return Ok(());
-        }
-
-        // Back up
-        let backup = path.with_extension("bak");
-        std::fs::copy(&path, &backup)
-            .with_context(|| format!("Failed to back up {} to {:?}", path.display(), backup))?;
-        println!("Backed up {} -> {:?}", path.display(), backup);
+    if !contents.is_empty() {
+        let backup = config_edit::backup(path)?;
+        println!("Backed up {} -> {}", path.display(), backup.display());
     }
 
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create {}", dir.display()))?;
+    }
+    config_edit::write_atomic(path, &updated)?;
 
-    writeln!(file)?;
-    write!(file, "{}", snippet)?;
-
-    println!("Added registration snippet to {}", path.display());
+    println!("Added tmux-ssh-agent block to {}", path.display());
     Ok(())
 }
 
 /// Handle the `uninstall` subcommand.
-/// Removes `run 'tmux-ssh-agent proxy'` from `~/.tmux.conf`.
-/// Backs up the original file before modifying.
-/// With `--shell`, also removes the login registration snippet from shell profile.
+/// Removes the proxy block from `~/.tmux.conf`, and with `--shell` the login
+/// snippet from every shell profile that carries one.
 fn cmd_uninstall(args: &[String]) -> Result<()> {
     let remove_shell = args.contains(&"--shell".to_string());
 
-    uninstall_tmux_config()?;
+    apply_uninstall(&home()?.join(".tmux.conf"), &config_edit::tmux_snippet())?;
+
     if remove_shell {
-        uninstall_shell_profile()?;
+        let home = home()?;
+        let mut removed_any = false;
+        // Check every candidate, not just the one install would pick now: the
+        // snippet may have gone into a different file under an older version or
+        // a different $SHELL.
+        for (rel, shell) in PROFILE_CANDIDATES {
+            let path = home.join(rel);
+            if !path.exists() {
+                continue;
+            }
+            removed_any |= apply_uninstall(&path, &config_edit::shell_snippet(shell))?;
+        }
+        if !removed_any {
+            println!("No registration snippet found in any shell profile");
+        }
     }
 
     println!("Uninstall complete. Reload tmux: tmux source-file ~/.tmux.conf");
     Ok(())
 }
 
-/// Remove the `run 'tmux-ssh-agent proxy'` line (and its preceding comment) from `~/.tmux.conf`.
-fn uninstall_tmux_config() -> Result<()> {
-    use std::io::{Read, Write};
-
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let path = std::path::PathBuf::from(home).join(".tmux.conf");
-    let run_line = "run 'tmux-ssh-agent proxy'";
-    let marker = "# Added by tmux-ssh-agent install";
-
-    if !path.exists() {
-        println!("Not found: {}", path.display());
-        return Ok(());
-    }
-
-    let mut contents = String::new();
-    std::fs::File::open(&path)?.read_to_string(&mut contents)?;
-
-    let has_run = contents.lines().any(|l| l.trim() == run_line);
-    if !has_run {
-        println!("Not found in {}: {}", path.display(), run_line);
-        return Ok(());
-    }
-
-    // Back up
-    let backup = path.with_extension("tmux.conf.bak");
-    std::fs::copy(&path, &backup)
-        .with_context(|| format!("Failed to back up {} to {:?}", path.display(), backup))?;
-    println!("Backed up {} -> {:?}", path.display(), backup);
-
-    // Filter out lines: remove run_line, marker, and adjacent blank lines around the block.
-    let mut result: Vec<&str> = Vec::new();
-    let lines: Vec<&str> = contents.lines().collect();
-    let mut i = 0;
-
-    while i < lines.len() {
-        let trimmed = lines[i].trim();
-
-        if trimmed == run_line {
-            // Remove a preceding blank line if it exists
-            if let Some(&prev) = result.last() {
-                if prev.trim().is_empty() {
-                    result.pop();
-                }
-            }
-            i += 1;
-            continue;
+/// Remove our block from `path`. Returns whether anything was removed.
+fn apply_uninstall(path: &Path, body: &[String]) -> Result<bool> {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            println!("Not found: {}", path.display());
+            return Ok(false);
         }
+        Err(e) => return Err(e).with_context(|| format!("Failed to read {}", path.display())),
+    };
 
-        if trimmed == marker {
-            // Remove a preceding blank line if it exists
-            if let Some(&prev) = result.last() {
-                if prev.trim().is_empty() {
-                    result.pop();
-                }
-            }
-            // Skip marker line and the next line (run line)
-            i += 2;
-            continue;
+    match config_edit::remove_block(&contents, body) {
+        Removal::NotPresent => Ok(false),
+        Removal::NeedsManual => {
+            println!(
+                "{} has a tmux-ssh-agent block that has been edited and is not \
+                 bounded by an end marker, so its extent cannot be determined. \
+                 Leaving it alone; remove the lines under {:?} by hand.",
+                path.display(),
+                config_edit::MARKER_BEGIN
+            );
+            Ok(false)
         }
-
-        result.push(lines[i]);
-        i += 1;
+        Removal::Removed(updated) => {
+            let backup = config_edit::backup(path)?;
+            println!("Backed up {} -> {}", path.display(), backup.display());
+            config_edit::write_atomic(path, &updated)?;
+            println!("Removed tmux-ssh-agent block from {}", path.display());
+            Ok(true)
+        }
     }
-
-    let mut file = std::fs::File::create(&path)?;
-    for line in &result {
-        writeln!(file, "{}", line)?;
-    }
-
-    println!("Removed from {}: {}", path.display(), run_line);
-    Ok(())
-}
-
-/// Remove the login registration snippet from shell profile.
-fn uninstall_shell_profile() -> Result<()> {
-    use std::io::{Read, Write};
-
-    let home = std::env::var("HOME").context("HOME not set")?;
-    let candidates = [".bashrc", ".zshrc", ".config/fish/config.fish"];
-
-    let mut removed = false;
-    for cand in &candidates {
-        let path = std::path::PathBuf::from(&home).join(cand);
-        if !path.exists() {
-            continue;
-        }
-
-        let mut contents = String::new();
-        std::fs::File::open(&path)?.read_to_string(&mut contents)?;
-
-        let marker = "# Added by tmux-ssh-agent install";
-        if !contents.contains(marker) {
-            continue;
-        }
-
-        // Back up
-        let backup = path.with_extension("bak");
-        std::fs::copy(&path, &backup)
-            .with_context(|| format!("Failed to back up {} to {:?}", path.display(), backup))?;
-        println!("Backed up {} -> {:?}", path.display(), backup);
-
-        // Remove lines from marker to the closing 'fi'
-        let mut result: Vec<&str> = Vec::new();
-        let lines: Vec<&str> = contents.lines().collect();
-        let mut i = 0;
-
-        while i < lines.len() {
-            if lines[i].trim() == marker {
-                // Skip lines until we hit 'fi'
-                i += 1;
-                while i < lines.len() && lines[i].trim() != "fi" {
-                    i += 1;
-                }
-                i += 1; // skip 'fi'
-                        // Remove a preceding blank line if it exists
-                if let Some(&prev) = result.last() {
-                    if prev.trim().is_empty() {
-                        result.pop();
-                    }
-                }
-                continue;
-            }
-            result.push(lines[i]);
-            i += 1;
-        }
-
-        let mut file = std::fs::File::create(&path)?;
-        for line in &result {
-            writeln!(file, "{}", line)?;
-        }
-
-        println!("Removed registration snippet from {}", path.display());
-        removed = true;
-    }
-
-    if !removed {
-        println!("No registration snippet found in shell profile");
-    }
-
-    Ok(())
 }
 
 /// Handle the `register-agent` subcommand.
