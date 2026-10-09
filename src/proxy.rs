@@ -32,8 +32,8 @@ const MAX_SOCKET_PATH_LEN: usize = 107;
 #[cfg(not(target_os = "linux"))]
 const MAX_SOCKET_PATH_LEN: usize = 103;
 
-/// Bytes of randomness in the socket name, rendered as twice as many hex
-/// characters.
+/// Bytes of the tmux server key in the socket name, rendered as twice as many
+/// hex characters.
 ///
 /// Eight keeps the whole path inside Darwin's limit with room to spare. The
 /// socket sits in a 0700 directory whose ownership is checked, so the name is
@@ -110,11 +110,12 @@ struct InstanceLock {
 }
 
 impl InstanceLock {
-    /// Take the lock, or return `None` if another daemon already holds it.
-    fn acquire(runtime_dir: &Path) -> Result<Option<Self>> {
+    /// Take the lock for the tmux server identified by `key`, or return `None`
+    /// if another daemon already holds it.
+    fn acquire(runtime_dir: &Path, key: &str) -> Result<Option<Self>> {
         use std::os::unix::fs::OpenOptionsExt;
 
-        let path = runtime_dir.join("proxy.lock");
+        let path = runtime_dir.join(format!("{key}.lock"));
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -190,7 +191,7 @@ impl ProxyAgent {
     }
 
     /// Run the accept loop:
-    /// 1. Create a random-named Unix socket in the runtime dir.
+    /// 1. Create a Unix socket in the runtime dir, named after the tmux server.
     /// 2. Set `SSH_AUTH_SOCK` in tmux global environment.
     /// 3. Call `ready` callback if provided (used by daemonized startup to signal parent).
     /// 4. Accept connections and spawn a handler thread for each.
@@ -203,15 +204,20 @@ impl ProxyAgent {
         // the invoking shell would publish a world-usable agent socket.
         umask(Mode::from_bits_truncate(0o077));
 
-        let hex: String = (0..SOCKET_NAME_BYTES)
-            .map(|_| format!("{:02x}", rand::random::<u8>()))
-            .collect();
-        let socket_path = runtime_dir.join(hex);
+        // The name is fixed per tmux server rather than random. Shells keep the
+        // SSH_AUTH_SOCK they were started with forever, so a proxy restarted
+        // under a new name strands every pane that already exists; with a
+        // stable name the replacement binds the same path and they keep working.
+        let key = server_key(&tmux_socket_path()?);
+        let socket_path = runtime_dir.join(&key);
         check_socket_path_fits(&socket_path)?;
 
-        let Some(_instance) = InstanceLock::acquire(&runtime_dir)? else {
-            // Another daemon is already serving this tmux server. Report success
-            // so that re-sourcing tmux.conf stays idempotent.
+        let Some(_instance) = InstanceLock::acquire(&runtime_dir, &key)? else {
+            // Another daemon is already serving this socket. Still publish it:
+            // the caller may be a tmux server that started after that daemon did
+            // (the previous one exited and a new one took over its socket
+            // path), and nothing else would ever set its environment.
+            publish("SSH_AUTH_SOCK", &socket_path)?;
             if let Some(f) = ready {
                 f();
             }
@@ -219,6 +225,11 @@ impl ProxyAgent {
         };
 
         sweep_stale_sockets(&runtime_dir);
+        // Holding the lock means no daemon is serving this path, so anything
+        // still there is left over from one that died, and bind would fail on it.
+        if std::fs::symlink_metadata(&socket_path).is_ok_and(|m| m.file_type().is_socket()) {
+            let _ = std::fs::remove_file(&socket_path);
+        }
         install_signal_handlers()?;
 
         let listener = UnixListener::bind(&socket_path)
@@ -233,8 +244,7 @@ impl ProxyAgent {
             .with_context(|| format!("Failed to set permissions on {socket_path:?}"))?;
         listener.set_nonblocking(true)?;
 
-        tmux::set_environment("SSH_AUTH_SOCK", &socket_path.to_string_lossy())?;
-        claim_environment("SSH_AUTH_SOCK")?;
+        publish("SSH_AUTH_SOCK", &socket_path)?;
 
         if let Some(f) = ready {
             f();
@@ -294,6 +304,43 @@ impl ProxyAgent {
 
         Ok(())
     }
+}
+
+/// The tmux server's socket path: the first field of `$TMUX`, which tmux sets
+/// as `socket_path,server_pid,session_id`.
+///
+/// Only the path identifies the server for our purposes. The pid changes when a
+/// server exits and a new one starts on the same path, but every `tmux` command
+/// the daemon runs goes by the path, so it is the same server as far as the
+/// daemon can tell.
+fn tmux_socket_path() -> Result<String> {
+    let tmux = std::env::var("TMUX").context("Not running under tmux server")?;
+    let path = tmux.split(',').next().unwrap_or_default();
+    if path.is_empty() {
+        anyhow::bail!("$TMUX does not name a socket: {tmux:?}");
+    }
+    Ok(path.to_string())
+}
+
+/// A short, stable name derived from the tmux socket path.
+///
+/// FNV-1a rather than `DefaultHasher`, whose algorithm the standard library
+/// does not promise to keep: a new build of the proxy has to arrive at the same
+/// name as the one that published the path panes are already using.
+fn server_key(tmux_socket: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in tmux_socket.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    let hex = format!("{hash:016x}");
+    hex[..SOCKET_NAME_BYTES * 2].to_string()
+}
+
+/// Point the calling tmux server's panes at the proxy socket.
+fn publish(name: &str, socket_path: &Path) -> Result<()> {
+    tmux::set_environment(name, &socket_path.to_string_lossy())?;
+    claim_environment(name)
 }
 
 /// Stop tmux from overwriting the variable we just set.
@@ -481,7 +528,7 @@ mod tests {
     }
 
     /// The bug that stopped the daemon ever starting on macOS: the socket name
-    /// was 16 bytes of randomness as 32 hex characters, which put the path over
+    /// was 16 random bytes as 32 hex characters, which put the path over
     /// Darwin's 104-byte `sun_path` for every uid.
     #[test]
     fn socket_path_fits_darwins_limit_for_realistic_uids() {
@@ -502,9 +549,26 @@ mod tests {
             let old = socket_path_for(DARWIN_TMPDIR, uid, 16);
             assert!(
                 old.as_os_str().len() > DARWIN_MAX,
-                "uid {uid}: 16 random bytes should not fit; this test is no longer meaningful"
+                "uid {uid}: 16 bytes should not fit; this test is no longer meaningful"
             );
         }
+    }
+
+    #[test]
+    fn the_server_key_is_stable_and_fits_the_socket_name() {
+        let key = server_key("/tmp/tmux-1000/default");
+        // Pinned, so a change to the hash that would strand every pane using
+        // the old path shows up as a test failure rather than in the field.
+        assert_eq!(key, server_key("/tmp/tmux-1000/default"));
+        assert_eq!(key.len(), SOCKET_NAME_BYTES * 2);
+        assert_ne!(key, server_key("/tmp/tmux-1000/other"));
+    }
+
+    #[test]
+    fn fnv1a_matches_the_reference_vectors() {
+        // From the FNV reference test suite: "" and "a" under 64-bit FNV-1a.
+        assert_eq!(server_key(""), "cbf29ce484222325");
+        assert_eq!(server_key("a"), "af63dc4c8601ec8c");
     }
 
     #[test]

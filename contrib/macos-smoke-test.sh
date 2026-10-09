@@ -94,7 +94,8 @@ SSH_AUTH_SOCK="$T/ag1.sock" ssh-add "$T/k1" >/dev/null 2>&1
 run register-agent "$T/ag1.sock" >/dev/null 2>&1 && ok "register-agent" || bad "register-agent"
 
 TMUXVAR=$(tmux -L smoke display-message -p '#{socket_path},#{pid},0')
-if env -u XDG_RUNTIME_DIR -u RUNTIME_DIRECTORY TMPDIR="$SOCKET_DIR" TMUX="$TMUXVAR" "$BIN" proxy; then
+run_tmux() { env -u XDG_RUNTIME_DIR -u RUNTIME_DIRECTORY TMPDIR="$SOCKET_DIR" TMUX="$TMUXVAR" "$BIN" "$@"; }
+if run_tmux proxy; then
   ok "proxy exits 0 (this is what fails on an unpatched build)"
 else
   bad "proxy exited non-zero; run it with --no-daemon to see the error"
@@ -188,8 +189,38 @@ head_ "9. Shutdown is clean"
 for p in $(our_daemons); do kill -TERM "$p" 2>/dev/null; done
 sleep 5
 [ "$(our_daemon_count)" = "0" ] && ok "daemon exited" || bad "daemon still running"
-LEFT=$(ls -1 "$RT" 2>/dev/null | grep -v -e '^state$' -e '^proxy.lock$' | wc -l | tr -d ' ')
+LEFT=$(ls -1 "$RT" 2>/dev/null | grep -v -e '^state$' -e '\.lock$' | wc -l | tr -d ' ')
 [ "$LEFT" = "0" ] && ok "socket removed on SIGTERM" || bad "$LEFT socket(s) left behind"
+
+head_ "10. Restart keeps the socket path"
+# Shells keep the SSH_AUTH_SOCK they started with, so a restarted proxy has to
+# come back on the same path or every existing pane is left pointing at nothing.
+run_tmux proxy >/dev/null 2>&1
+sleep 1
+SOCK2=$(tmux -L smoke show-environment -g SSH_AUTH_SOCK 2>/dev/null | cut -d= -f2)
+if [ -n "$SOCK" ] && [ "$SOCK2" = "$SOCK" ]; then
+  ok "the restarted proxy reuses $SOCK"
+else
+  bad "the restarted proxy moved to '${SOCK2:-nothing}' from $SOCK"
+fi
+
+# A tmux server that starts while a daemon from an earlier server on the same
+# socket path is still running must still get the socket published, rather
+# than the new start seeing the lock and leaving.
+tmux -L smoke set-environment -g SSH_AUTH_SOCK "$DECOY"
+tmux -L smoke set-option -ga update-environment SSH_AUTH_SOCK
+run_tmux proxy >/dev/null 2>&1
+AGAIN=$(tmux -L smoke show-environment -g SSH_AUTH_SOCK 2>/dev/null | cut -d= -f2)
+if [ -n "$SOCK" ] && [ "$AGAIN" = "$SOCK" ]; then
+  ok "a start against a running daemon republishes the socket"
+else
+  bad "a start against a running daemon left SSH_AUTH_SOCK at '${AGAIN:-nothing}'"
+fi
+if tmux -L smoke show-options -g update-environment | grep -q SSH_AUTH_SOCK; then
+  bad "a start against a running daemon left SSH_AUTH_SOCK in update-environment"
+else
+  ok "a start against a running daemon reclaims update-environment"
+fi
 
 printf '\n== Summary ==\n  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

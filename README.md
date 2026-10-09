@@ -54,7 +54,9 @@ The runtime directory is, in order of preference:
 2. `$XDG_RUNTIME_DIR/tmux-ssh-agent-proxy`
 3. `$TMPDIR/tmux-ssh-agent-proxy-$UID`, defaulting to `/tmp`
 
-It holds the proxy socket, the `state` file mapping TTYs to agents, and `proxy.lock`.
+It holds the proxy socket, the `state` file mapping TTYs to agents, and a lock file next to the socket.
+
+The socket is named after the tmux server it serves (a hash of the tmux socket path), not chosen at random. A shell keeps the `SSH_AUTH_SOCK` it was started with for its whole life, so if the proxy is ever restarted it has to come back on the same path, or every pane that already exists is left pointing at a dead socket.
 
 ## Platforms
 
@@ -138,7 +140,9 @@ Add to `~/.tmux.conf`:
 run 'tmux-ssh-agent proxy'
 ```
 
-This forks a daemon that creates a random-named Unix socket and sets the tmux global environment variable `SSH_AUTH_SOCK` to point at it. The proxy runs as long as the tmux server does, and only one runs at a time.
+This forks a daemon that creates a Unix socket and sets the tmux global environment variable `SSH_AUTH_SOCK` to point at it. The proxy runs as long as the tmux server does, and only one runs per tmux server.
+
+If a daemon is already running for this tmux socket, `proxy` does not start a second one, but it still publishes the socket and takes `SSH_AUTH_SOCK` out of `update-environment`. That matters when a tmux server exits and a new one starts on the same socket path while the old daemon is still running: the daemon carries on serving the new server, and without this the new server would never be told about it.
 
 To run in the foreground for debugging:
 

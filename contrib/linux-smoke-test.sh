@@ -164,6 +164,26 @@ N_SOCK=$(find "$RT" -maxdepth 1 -type s | wc -l | tr -d ' ')
 if [ "$N_DAEMON" = "1" ]; then ok "three starts left one daemon"; else bad "$N_DAEMON daemons running"; fi
 if [ "$N_SOCK" = "1" ]; then ok "three starts left one socket"; else bad "$N_SOCK sockets in the runtime dir"; fi
 
+# A tmux server that starts while a daemon from an earlier server on the same
+# socket path is still running: the daemon keeps serving, but the new server
+# has the client's agent in its environment and SSH_AUTH_SOCK back in
+# update-environment. Starting the proxy again must fix both rather than just
+# see the lock and leave.
+tmux -L smoke set-environment -g SSH_AUTH_SOCK "$DECOY"
+tmux -L smoke set-option -ga update-environment SSH_AUTH_SOCK
+run_tmux proxy >/dev/null 2>&1
+AGAIN=$(tmux -L smoke show-environment -g SSH_AUTH_SOCK 2>/dev/null | cut -d= -f2)
+if [ -n "$SOCK" ] && [ "$AGAIN" = "$SOCK" ]; then
+  ok "a start against a running daemon republishes the socket"
+else
+  bad "a start against a running daemon left SSH_AUTH_SOCK at '${AGAIN:-nothing}'"
+fi
+if tmux -L smoke show-options -g update-environment | grep -q SSH_AUTH_SOCK; then
+  bad "a start against a running daemon left SSH_AUTH_SOCK in update-environment"
+else
+  ok "a start against a running daemon reclaims update-environment"
+fi
+
 head_ "8. Per-pane routing"
 tmux -L smoke -f /dev/null new-session -d -s s2 bash
 setsid script -qfc "tmux -L smoke attach -t s2" /dev/null >/dev/null 2>&1 &
@@ -235,6 +255,23 @@ else
 fi
 LEFT=$(find "$RT" -maxdepth 1 -type s | wc -l | tr -d ' ')
 if [ "$LEFT" = "0" ]; then ok "socket removed on SIGTERM"; else bad "$LEFT socket(s) left behind"; fi
+
+head_ "12. Restart keeps the socket path"
+# Shells keep the SSH_AUTH_SOCK they started with, so a restarted proxy has to
+# come back on the same path or every existing pane is left pointing at nothing.
+run_tmux proxy >/dev/null 2>&1
+sleep 1
+SOCK2=$(tmux -L smoke show-environment -g SSH_AUTH_SOCK 2>/dev/null | cut -d= -f2)
+if [ -n "$SOCK" ] && [ "$SOCK2" = "$SOCK" ]; then
+  ok "the restarted proxy reuses $SOCK"
+else
+  bad "the restarted proxy moved to '${SOCK2:-nothing}' from $SOCK"
+fi
+if [ -n "$SOCK" ] && SSH_AUTH_SOCK="$SOCK" timeout 15 ssh-add -l 2>/dev/null | grep -q 'KEY[0-9]'; then
+  ok "the old path works again after the restart"
+else
+  bad "the old path does not work after the restart"
+fi
 
 printf '\n== Summary ==\n  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
