@@ -1,6 +1,6 @@
 use crate::config_edit::{self, Removal, Shell};
 use crate::proxy::ProxyAgent;
-use crate::state::StateFile;
+use crate::state::{State, StateFile};
 use anyhow::{Context, Result};
 use nix::errno::Errno;
 use nix::fcntl::{fcntl, FcntlArg};
@@ -10,63 +10,294 @@ use std::io::Write;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
+/// Name the help text uses for the program. Fixed rather than taken from
+/// `argv[0]`, which is often a full path.
+const PROGRAM: &str = env!("CARGO_PKG_NAME");
+
+/// Help for one subcommand. `COMMANDS` is the single source of all help text.
+struct CommandHelp {
+    name: &'static str,
+    aliases: &'static [&'static str],
+    /// Arguments, without the program or command name.
+    synopsis: &'static str,
+    /// One line for the overview.
+    summary: &'static str,
+    /// Full description for `help <command>` and `<command> --help`.
+    details: &'static str,
+}
+
+const COMMANDS: &[CommandHelp] = &[
+    CommandHelp {
+        name: "proxy",
+        aliases: &[],
+        synopsis: "[--no-daemon]",
+        summary: "Start the proxy for this tmux server (run from tmux.conf)",
+        details: "\
+Starts the forwarding socket for the current tmux server and publishes it as
+SSH_AUTH_SOCK in the tmux global environment. It also takes SSH_AUTH_SOCK out
+of tmux's update-environment option and clears it from existing sessions, so
+that attaching later cannot hide the proxy socket again.
+
+The proxy runs in the background for as long as the tmux server does. Only one
+runs per tmux server: if one is already running, this publishes its socket
+again and exits.
+
+Must be run inside tmux, normally from ~/.tmux.conf:
+  run 'tmux-ssh-agent proxy'
+
+Options:
+  --no-daemon   Stay in the foreground and print errors to the terminal.
+                Use this for debugging: the daemon discards its output.
+",
+    },
+    CommandHelp {
+        name: "install",
+        aliases: &[],
+        synopsis: "[--shell]",
+        summary: "Add the proxy to ~/.tmux.conf (and the login snippet with --shell)",
+        details: "\
+Adds a block to ~/.tmux.conf that starts the proxy, backing the file up first.
+Reload tmux afterwards with:
+  tmux source-file ~/.tmux.conf
+Running install again changes nothing.
+
+Options:
+  --shell   Also add the agent registration snippet to your shell profile,
+            chosen from $SHELL: ~/.bashrc for bash, ~/.zshrc for zsh, or
+            ~/.config/fish/config.fish (in fish syntax) for fish.
+
+Everything written sits between the lines
+  # Added by tmux-ssh-agent install
+  # End tmux-ssh-agent
+which is exactly what uninstall removes.
+",
+    },
+    CommandHelp {
+        name: "uninstall",
+        aliases: &[],
+        synopsis: "[--shell]",
+        summary: "Remove what install added",
+        details: "\
+Removes the block install added to ~/.tmux.conf, backing the file up first.
+Only the lines between the install markers are removed. If the end marker was
+deleted by hand, the block is left alone and you are told to remove it
+yourself, rather than guessing where it ends.
+
+Options:
+  --shell   Also remove the registration snippet from every shell profile
+            that has one: ~/.bashrc, ~/.zshrc, ~/.config/fish/config.fish.
+",
+    },
+    CommandHelp {
+        name: "register-agent",
+        aliases: &[],
+        synopsis: "[--tty TTY] [SOCKET]",
+        summary: "Register an SSH agent for a terminal (run from your login shell)",
+        details: "\
+Records that tmux clients attached from terminal TTY should use the SSH agent
+at SOCKET. Panes in a session use the agent of the client attached to it.
+Prints nothing on success. If TTY already had a live agent, it is replaced
+and the old one is reported on stderr.
+
+Arguments:
+  SOCKET      The agent socket. Defaults to $SSH_AUTH_SOCK. It must be an
+              existing socket owned by you, and not the proxy's own socket.
+
+Options:
+  --tty TTY   The terminal to register for, as shown by list-agents, e.g.
+              /dev/pts/3. Defaults to the terminal you run this from
+              ($SSH_TTY, or the terminal on standard input).
+
+Run it from your login shell, before tmux starts, typically from your
+shell profile:
+  if [ -z \"$TMUX\" ] && [ -n \"$SSH_AUTH_SOCK\" ]; then
+    tmux-ssh-agent register-agent
+  fi
+
+Inside tmux it will not guess the terminal: a pane has its own terminal, which
+is not the one the proxy routes by, so pass --tty and SOCKET explicitly. The
+first line of list-agents, run in the pane, names the terminal to use.
+",
+    },
+    CommandHelp {
+        name: "register-default-agent",
+        aliases: &[],
+        synopsis: "[--override] [SOCKET]",
+        summary: "Set the agent used by tmux clients with no registration",
+        details: "\
+Sets the fallback agent, used for a tmux client whose terminal has no
+registration of its own. It is never used when no tmux client can be
+identified at all.
+
+Arguments:
+  SOCKET       The agent socket. Defaults to $SSH_AUTH_SOCK. It must be an
+               existing socket owned by you, and not the proxy's own socket.
+               Inside tmux, $SSH_AUTH_SOCK is the proxy, so pass SOCKET.
+
+Options:
+  --override   Replace an existing default. Without it, an existing default
+               is kept and this does nothing.
+",
+    },
+    CommandHelp {
+        name: "remove-agent",
+        aliases: &[],
+        synopsis: "[--tty TTY | TTY]",
+        summary: "Remove the agent registered for a terminal",
+        details: "\
+Removes the registration for terminal TTY. The default agent is not touched;
+clear-agents removes that.
+
+Arguments:
+  TTY, --tty TTY   The terminal whose registration to remove, as shown by
+                   list-agents. Defaults to the terminal you run this from.
+                   Inside tmux there is no safe default, so name it.
+",
+    },
+    CommandHelp {
+        name: "clear-agents",
+        aliases: &[],
+        synopsis: "[--yes]",
+        summary: "Remove every registration and the default agent",
+        details: "\
+Removes every per-terminal registration and the default agent. Asks for
+confirmation first.
+
+Options:
+  -y, --yes   Do not ask. Required when not running interactively.
+",
+    },
+    CommandHelp {
+        name: "list-agents",
+        aliases: &["list"],
+        synopsis: "",
+        summary: "List registrations and mark the one in use with '*'",
+        details: "\
+Lists the default agent and each registered terminal with its agent.
+Registrations whose agent socket no longer exists are dropped as a side
+effect.
+
+Outside tmux, '*' marks the registration of the terminal you run it from.
+
+Inside tmux, the first line names the tmux client this pane belongs to, which
+is what the proxy chooses an agent by, and '*' marks the agent the proxy
+would use for this pane: that client's registration, or else the default.
+No '*' means this pane gets no agent: register one for that client terminal
+with 'register-agent --tty', or set a default.
+",
+    },
+];
+
+/// The help entry for a command name or alias.
+fn find_command(name: &str) -> Option<&'static CommandHelp> {
+    COMMANDS
+        .iter()
+        .find(|c| c.name == name || c.aliases.contains(&name))
+}
+
+/// Full help text for one command, or `None` if there is no such command.
+fn command_help(name: &str) -> Option<String> {
+    let c = find_command(name)?;
+    let mut out = format!("Usage: {PROGRAM} {} {}", c.name, c.synopsis)
+        .trim_end()
+        .to_string();
+    out.push_str("\n\n");
+    out.push_str(c.summary);
+    out.push_str(".\n\n");
+    out.push_str(c.details);
+    if !c.aliases.is_empty() {
+        out.push_str(&format!("\nAlias: {}\n", c.aliases.join(", ")));
+    }
+    Some(out)
+}
+
+/// The overview: every command's synopsis and summary.
+fn usage() -> String {
+    let mut out = format!("{PROGRAM}: give each tmux client its own SSH agent.\n\nUsage:\n");
+    for c in COMMANDS {
+        let line = format!("{} {}", c.name, c.synopsis);
+        out.push_str(&format!("  {PROGRAM} {}\n", line.trim_end()));
+        out.push_str(&format!("      {}\n", c.summary));
+    }
+    out.push_str(&format!("  {PROGRAM} --help | --version\n"));
+    out.push_str(&format!(
+        "\nRun '{PROGRAM} help <command>' or '{PROGRAM} <command> --help' for details.\n"
+    ));
+    out
+}
+
+/// Report an unknown command with the overview, as an error.
+fn unknown_command(name: &str) -> Result<()> {
+    eprint!("{}", usage());
+    anyhow::bail!("Unknown command {name:?}")
+}
+
 /// Parse CLI arguments and dispatch to the matching subcommand handler.
-/// Exits with code 1 on unknown subcommand or missing args.
+/// Exits with code 1 when no command is given; unknown commands are errors.
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        print_usage();
+    let Some(cmd) = args.get(1) else {
+        eprint!("{}", usage());
         std::process::exit(1);
-    }
+    };
+    let rest = &args[2..];
 
-    match args[1].as_str() {
-        "--help" | "-h" | "help" => {
-            print_usage_to(&mut std::io::stdout());
-            Ok(())
+    match cmd.as_str() {
+        "--help" | "-h" => {
+            print!("{}", usage());
+            return Ok(());
+        }
+        "help" => {
+            return match rest.first() {
+                None => {
+                    print!("{}", usage());
+                    Ok(())
+                }
+                Some(name) => match command_help(name) {
+                    Some(text) => {
+                        print!("{text}");
+                        Ok(())
+                    }
+                    None => unknown_command(name),
+                },
+            };
         }
         "--version" | "-V" => {
             println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-            Ok(())
+            return Ok(());
         }
-        "proxy" => cmd_proxy(&args[2..]),
-        "register-agent" => cmd_register_agent(&args[2..]),
-        "register-default-agent" => cmd_register_default_agent(&args[2..]),
-        "install" => cmd_install(&args[2..]),
-        "uninstall" => cmd_uninstall(&args[2..]),
-        "list" | "list-agents" => cmd_list_agents(),
-        "remove-agent" => cmd_remove_agent(&args[2..]),
-        "clear-agents" => cmd_clear_agents(&args[2..]),
-        _ => {
-            print_usage();
-            std::process::exit(1);
+        _ => {}
+    }
+
+    let Some(command) = find_command(cmd) else {
+        return unknown_command(cmd);
+    };
+
+    // Answer --help before the command parses its arguments, so it is never
+    // rejected as an unknown option or, worse, ignored.
+    if wants_help(rest) {
+        if let Some(text) = command_help(command.name) {
+            print!("{text}");
         }
+        return Ok(());
+    }
+
+    match command.name {
+        "proxy" => cmd_proxy(rest),
+        "register-agent" => cmd_register_agent(rest),
+        "register-default-agent" => cmd_register_default_agent(rest),
+        "install" => cmd_install(rest),
+        "uninstall" => cmd_uninstall(rest),
+        "list-agents" => cmd_list_agents(rest),
+        "remove-agent" => cmd_remove_agent(rest),
+        "clear-agents" => cmd_clear_agents(rest),
+        other => unreachable!("command {other:?} has help but no handler"),
     }
 }
 
-/// Print usage information to stderr.
-fn print_usage() {
-    print_usage_to(&mut std::io::stderr());
-}
-
-/// Print usage information to `out`, so an explicit `--help` can go to stdout
-/// while a usage error goes to stderr.
-fn print_usage_to(out: &mut dyn std::io::Write) {
-    let name = std::env::args()
-        .next()
-        .unwrap_or_else(|| "tmux-ssh-agent".to_string());
-    let _ = writeln!(out, "Usage:");
-    let _ = writeln!(out, "  {name} proxy [--no-daemon]");
-    let _ = writeln!(out, "  {name} install [--shell]");
-    let _ = writeln!(out, "  {name} uninstall [--shell]");
-    let _ = writeln!(out, "  {name} register-agent [SSH_AUTH_SOCK]");
-    let _ = writeln!(
-        out,
-        "  {name} register-default-agent [--override] [SSH_AUTH_SOCK]"
-    );
-    let _ = writeln!(out, "  {name} remove-agent [TTY]");
-    let _ = writeln!(out, "  {name} clear-agents [--yes]");
-    let _ = writeln!(out, "  {name} list-agents");
-    let _ = writeln!(out, "  {name} --help | --version");
+/// Whether the arguments ask for help.
+fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--help" || a == "-h")
 }
 
 /// Reject any option this subcommand does not understand.
@@ -80,6 +311,36 @@ fn reject_unknown_flags(args: &[String], allowed: &[&str]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Take `name VALUE` or `name=VALUE` out of `args`, returning the value and
+/// the remaining arguments in order. Errors if the value is missing or the
+/// option is given twice.
+fn take_option(args: &[String], name: &str) -> Result<(Option<String>, Vec<String>)> {
+    let prefix = format!("{name}=");
+    let mut value = None;
+    let mut rest = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        let found = if arg == name {
+            match iter.next() {
+                Some(v) if !v.is_empty() && !v.starts_with('-') => v.clone(),
+                _ => anyhow::bail!("{name} needs a value"),
+            }
+        } else if let Some(v) = arg.strip_prefix(&prefix) {
+            if v.is_empty() {
+                anyhow::bail!("{name} needs a value");
+            }
+            v.to_string()
+        } else {
+            rest.push(arg.clone());
+            continue;
+        };
+        if value.replace(found).is_some() {
+            anyhow::bail!("{name} given more than once");
+        }
+    }
+    Ok((value, rest))
 }
 
 /// Handle the `proxy` subcommand.
@@ -389,22 +650,32 @@ fn apply_uninstall(path: &Path, body: &[String]) -> Result<bool> {
 }
 
 /// Handle the `register-agent` subcommand.
-/// Registers the given agent socket (or `$SSH_AUTH_SOCK`) for the current TTY.
-/// Args: optional explicit socket path; env var `SSH_AUTH_SOCK` is used as fallback.
+/// Registers the given agent socket (or `$SSH_AUTH_SOCK`) for a TTY: the one
+/// named by `--tty`, else the current one, which inside tmux is refused.
 fn cmd_register_agent(args: &[String]) -> Result<()> {
-    reject_unknown_flags(args, &[])?;
-    let tty = require_tty()?;
-    let agent = args
+    let (tty, rest) = take_option(args, "--tty")?;
+    reject_unknown_flags(&rest, &[])?;
+    if rest.len() > 1 {
+        anyhow::bail!("Too many arguments. Run with --help for usage.");
+    }
+    let tty = target_tty(tty, "register-agent")?;
+    let agent = rest
         .first()
         .cloned()
         .or_else(|| std::env::var("SSH_AUTH_SOCK").ok())
         .ok_or_else(|| anyhow::anyhow!("No SSH_AUTH_SOCK specified"))?;
     let agent = crate::ssh_agent::validate_agent_socket(&agent)?;
+    refuse_proxy_socket(&agent)?;
 
     let state_file = StateFile::open_default()?;
-    state_file.with_lock(|state| {
-        state.agents.insert(tty, agent);
-    })
+    let previous = state_file.with_lock(|state| state.agents.insert(tty.clone(), agent.clone()))?;
+    // Silent otherwise: the login snippet runs this on every login. Dead
+    // agents were already dropped by the state cleanup, so this only fires
+    // when a live registration is overwritten, which is worth knowing.
+    if let Some(old) = previous.filter(|old| *old != agent) {
+        eprintln!("Replaced the agent registered for {tty}: was {old}, now {agent}");
+    }
+    Ok(())
 }
 
 /// Handle the `register-default-agent` subcommand.
@@ -421,6 +692,7 @@ fn cmd_register_default_agent(args: &[String]) -> Result<()> {
         .or_else(|| std::env::var("SSH_AUTH_SOCK").ok())
         .ok_or_else(|| anyhow::anyhow!("No SSH_AUTH_SOCK specified"))?;
     let agent = crate::ssh_agent::validate_agent_socket(&agent)?;
+    refuse_proxy_socket(&agent)?;
 
     let state_file = StateFile::open_default()?;
     state_file.with_lock(|state| {
@@ -430,38 +702,106 @@ fn cmd_register_default_agent(args: &[String]) -> Result<()> {
     })
 }
 
+/// Refuse to register the proxy's own socket as an upstream agent.
+///
+/// Inside tmux `$SSH_AUTH_SOCK` names the proxy, so taking it as the default
+/// would make the proxy forward to itself. Both sides are canonicalised: on
+/// macOS `$TMPDIR` lives under `/var`, which resolves to `/private/var`.
+fn refuse_proxy_socket(agent: &str) -> Result<()> {
+    let runtime_dir = StateFile::runtime_dir()?;
+    let runtime_dir = std::fs::canonicalize(&runtime_dir).unwrap_or(runtime_dir);
+    if Path::new(agent).parent() == Some(runtime_dir.as_path()) {
+        anyhow::bail!(
+            "{agent} is the tmux-ssh-agent proxy socket, not an SSH agent. \
+             Inside tmux $SSH_AUTH_SOCK points at the proxy; pass the real agent socket."
+        );
+    }
+    Ok(())
+}
+
+/// What `list-agents` marks with `*`.
+#[derive(Debug, PartialEq, Eq)]
+enum Marker {
+    /// The registration of this terminal.
+    Entry(String),
+    /// The default agent.
+    Default,
+    Nothing,
+}
+
+/// Decide which line `list-agents` stars.
+///
+/// `client` is the terminal to look up, `None` if it is unknown. With
+/// `use_default`, a client with no registration of its own stars the default,
+/// which is what the proxy hands it (`proxy::get_agent_for_client`). Outside
+/// tmux the CLI is not talking to the proxy, so the default means nothing
+/// there and is never starred.
+fn starred(state: &State, client: Option<&str>, use_default: bool) -> Marker {
+    let Some(client) = client else {
+        return Marker::Nothing;
+    };
+    if state.agents.contains_key(client) {
+        Marker::Entry(client.to_string())
+    } else if use_default && state.default_agent.is_some() {
+        Marker::Default
+    } else {
+        Marker::Nothing
+    }
+}
+
 /// Handle the `list-agents` / `list` subcommand.
-/// Prints the default agent (if set) and all per-TTY registrations.
-/// The current TTY is marked with `*`.
-fn cmd_list_agents() -> Result<()> {
-    let tty = get_tty();
+/// Prints the default agent (if set) and all per-TTY registrations, starring
+/// the one in use: see `starred`. Inside tmux, first names the client.
+fn cmd_list_agents(args: &[String]) -> Result<()> {
+    reject_unknown_flags(args, &[])?;
+
+    // Resolve before taking the state lock: this runs tmux.
+    let lookup = lookup_client();
+    let (client, in_tmux) = match &lookup {
+        ClientLookup::NotInTmux => (get_tty(), false),
+        ClientLookup::Pane(tty) => {
+            println!("client: {tty}");
+            (Some(tty.clone()), true)
+        }
+        ClientLookup::Fallback(tty) => {
+            println!("client: {tty} (most recently active; this process is not in a pane)");
+            (Some(tty.clone()), true)
+        }
+        ClientLookup::Unknown => {
+            println!("client: unknown (no tmux client found)");
+            (None, true)
+        }
+    };
 
     let state_file = StateFile::open_default()?;
     state_file.with_lock(|state| {
+        let marker = starred(state, client.as_deref(), in_tmux);
+        let mark = |on: bool| if on { "*" } else { " " };
         if let Some(ref default) = state.default_agent {
-            println!("  default: {}", default);
+            println!("{} default: {}", mark(marker == Marker::Default), default);
         }
         let mut agents: Vec<_> = state.agents.iter().collect();
         agents.sort_by(|a, b| a.0.cmp(b.0));
-        for (client, agent) in agents {
-            let marker = if Some(client.as_str()) == tty.as_deref() {
-                "*"
-            } else {
-                " "
-            };
-            println!("{} {}: {}", marker, client, agent);
+        for (tty, agent) in agents {
+            let on = matches!(&marker, Marker::Entry(t) if t == tty);
+            println!("{} {}: {}", mark(on), tty, agent);
         }
     })
 }
 
 /// Handle the `remove-agent` subcommand.
-/// Removes the registration for the given TTY, or current TTY if none specified.
+/// Removes the registration for the TTY given positionally or with `--tty`,
+/// else for the current one, which inside tmux is refused.
 fn cmd_remove_agent(args: &[String]) -> Result<()> {
-    reject_unknown_flags(args, &[])?;
-    let tty = match args.first() {
-        Some(t) => t.clone(),
-        None => require_tty()?,
+    let (flag_tty, rest) = take_option(args, "--tty")?;
+    reject_unknown_flags(&rest, &[])?;
+    let explicit = match (flag_tty, rest.as_slice()) {
+        (t, []) => t,
+        (None, [t]) => Some(t.clone()),
+        (Some(_), [_]) => anyhow::bail!("Give the TTY either positionally or with --tty, not both"),
+        _ => anyhow::bail!("Too many arguments. Run with --help for usage."),
     };
+    let tty = target_tty(explicit, "remove-agent")?;
     let state_file = StateFile::open_default()?;
     let removed = state_file.with_lock(|state| state.agents.remove(&tty))?;
     if removed.is_some() {
@@ -516,6 +856,35 @@ fn confirm(question: &str) -> Result<bool> {
     ))
 }
 
+/// Which tmux client this process belongs to.
+enum ClientLookup {
+    /// `$TMUX` is unset: this is not running under tmux.
+    NotInTmux,
+    /// Found by walking up to the pane this process runs in, exactly as the
+    /// proxy routes a connection.
+    Pane(String),
+    /// Not inside a pane (e.g. `tmux run-shell`); the most recently active
+    /// client, which is the proxy's own fallback.
+    Fallback(String),
+    /// Under tmux, but no client could be found.
+    Unknown,
+}
+
+/// Find the tmux client this process belongs to, in the same order the proxy
+/// uses (`proxy::resolve_client_tty`).
+fn lookup_client() -> ClientLookup {
+    if std::env::var_os("TMUX").map_or(true, |v| v.is_empty()) {
+        return ClientLookup::NotInTmux;
+    }
+    if let Some(tty) = crate::routing::client_tty_for_pid(std::process::id() as i32) {
+        return ClientLookup::Pane(tty);
+    }
+    match crate::tmux::current_client() {
+        Some(tty) => ClientLookup::Fallback(tty),
+        None => ClientLookup::Unknown,
+    }
+}
+
 /// Get the current TTY path, if there is one.
 ///
 /// Checks `$SSH_TTY` first, then asks the kernel via `ttyname(3)` on stdin.
@@ -523,6 +892,10 @@ fn confirm(question: &str) -> Result<bool> {
 /// against the English string "not a tty", which does not match under any other
 /// locale, and fell back to the literal key "unknown" that every TTY-less
 /// session then shared.
+///
+/// Only meaningful outside tmux. In a pane this is the pane's own terminal, or
+/// a `$SSH_TTY` the tmux server inherited when it started, neither of which is
+/// the client terminal the proxy routes by.
 fn get_tty() -> Option<String> {
     if let Ok(val) = std::env::var("SSH_TTY") {
         if !val.is_empty() {
@@ -534,12 +907,155 @@ fn get_tty() -> Option<String> {
         .map(|p| p.to_string_lossy().into_owned())
 }
 
-/// Get the current TTY path or fail with an actionable message.
-fn require_tty() -> Result<String> {
-    get_tty().ok_or_else(|| {
-        anyhow::anyhow!(
-            "No TTY for this session, so there is nothing to register an agent against. \
-             Pass the TTY explicitly, or set $SSH_TTY."
-        )
-    })
+/// The TTY a registration command acts on: `explicit` if given, else the
+/// current terminal.
+///
+/// Inside tmux there is no safe default. The pane's terminal is never a
+/// routing key, and silently using the client's would overwrite or delete the
+/// registration the login shell made for every session on that client.
+fn target_tty(explicit: Option<String>, command: &str) -> Result<String> {
+    if let Some(tty) = explicit {
+        return Ok(tty);
+    }
+    match lookup_client() {
+        ClientLookup::NotInTmux => get_tty().ok_or_else(|| {
+            anyhow::anyhow!(
+                "No TTY for this session, so there is nothing to act on. \
+                 Pass the terminal explicitly: {PROGRAM} {command} --tty TTY"
+            )
+        }),
+        ClientLookup::Pane(client) => anyhow::bail!(
+            "Inside tmux this would act on the registration of client {client}, which \
+             every session attached from it shares. Registrations normally come from the \
+             login shell, outside tmux. To do it anyway, say so: \
+             {PROGRAM} {command} --tty {client}"
+        ),
+        ClientLookup::Fallback(_) | ClientLookup::Unknown => anyhow::bail!(
+            "Inside tmux, and this process is not in a pane, so the tmux client cannot \
+             be identified. Pass the terminal explicitly: {PROGRAM} {command} --tty TTY \
+             (see {PROGRAM} list-agents)"
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn state(agents: &[(&str, &str)], default: Option<&str>) -> State {
+        State {
+            agents: agents
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            default_agent: default.map(str::to_string),
+        }
+    }
+
+    /// Every name `run` dispatches, aliases included. Kept by hand on purpose:
+    /// a command added to the dispatcher without help text fails here.
+    const DISPATCHED: &[&str] = &[
+        "proxy",
+        "install",
+        "uninstall",
+        "register-agent",
+        "register-default-agent",
+        "remove-agent",
+        "clear-agents",
+        "list-agents",
+        "list",
+    ];
+
+    #[test]
+    fn every_command_has_help() {
+        for name in DISPATCHED {
+            let text = command_help(name).unwrap_or_else(|| panic!("no help for {name}"));
+            assert!(text.starts_with("Usage: tmux-ssh-agent "), "{text}");
+            assert!(text.len() > 200, "help for {name} is too thin");
+        }
+        assert_eq!(command_help("list"), command_help("list-agents"));
+        assert!(command_help("bogus").is_none());
+    }
+
+    #[test]
+    fn overview_lists_every_command_with_a_summary() {
+        let text = usage();
+        for c in COMMANDS {
+            assert!(
+                text.contains(&format!("tmux-ssh-agent {}", c.name)),
+                "{}",
+                c.name
+            );
+            assert!(text.contains(c.summary), "{}", c.name);
+        }
+        assert!(text.contains("help <command>"));
+    }
+
+    #[test]
+    fn help_flags_are_recognised_anywhere() {
+        assert!(wants_help(&strings(&["--help"])));
+        assert!(wants_help(&strings(&["--tty", "/dev/pts/1", "-h"])));
+        assert!(!wants_help(&strings(&["/tmp/agent.sock"])));
+    }
+
+    #[test]
+    fn install_help_names_the_real_markers() {
+        let text = command_help("install").unwrap();
+        assert!(text.contains(config_edit::MARKER_BEGIN));
+        assert!(text.contains(config_edit::MARKER_END));
+    }
+
+    #[test]
+    fn take_option_separates_value_and_rest() {
+        let (v, rest) = take_option(&strings(&["--tty", "/dev/pts/3", "/s"]), "--tty").unwrap();
+        assert_eq!(v.as_deref(), Some("/dev/pts/3"));
+        assert_eq!(rest, strings(&["/s"]));
+
+        let (v, rest) = take_option(&strings(&["/s", "--tty=/dev/pts/4"]), "--tty").unwrap();
+        assert_eq!(v.as_deref(), Some("/dev/pts/4"));
+        assert_eq!(rest, strings(&["/s"]));
+
+        let (v, rest) = take_option(&strings(&["/s"]), "--tty").unwrap();
+        assert_eq!(v, None);
+        assert_eq!(rest, strings(&["/s"]));
+    }
+
+    #[test]
+    fn take_option_rejects_missing_or_repeated_values() {
+        assert!(take_option(&strings(&["--tty"]), "--tty").is_err());
+        assert!(take_option(&strings(&["--tty", "--help"]), "--tty").is_err());
+        assert!(take_option(&strings(&["--tty="]), "--tty").is_err());
+        assert!(take_option(&strings(&["--tty", "a", "--tty", "b"]), "--tty").is_err());
+    }
+
+    #[test]
+    fn star_outside_tmux_marks_own_entry_only() {
+        let s = state(&[("/dev/pts/1", "/a")], Some("/d"));
+        assert_eq!(
+            starred(&s, Some("/dev/pts/1"), false),
+            Marker::Entry("/dev/pts/1".into())
+        );
+        assert_eq!(starred(&s, Some("/dev/pts/9"), false), Marker::Nothing);
+    }
+
+    #[test]
+    fn star_inside_tmux_marks_what_the_proxy_uses() {
+        let s = state(&[("/dev/pts/1", "/a")], Some("/d"));
+        assert_eq!(
+            starred(&s, Some("/dev/pts/1"), true),
+            Marker::Entry("/dev/pts/1".into())
+        );
+        assert_eq!(starred(&s, Some("/dev/pts/9"), true), Marker::Default);
+        assert_eq!(starred(&s, None, true), Marker::Nothing);
+
+        let no_default = state(&[("/dev/pts/1", "/a")], None);
+        assert_eq!(
+            starred(&no_default, Some("/dev/pts/9"), true),
+            Marker::Nothing
+        );
+    }
 }

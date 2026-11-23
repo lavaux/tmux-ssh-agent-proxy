@@ -91,7 +91,7 @@ TTY1=$(tmux -L smoke list-clients -F '#{client_tty}' | head -1)
 ssh-agent -s -a "$T/ag1.sock" >/dev/null
 ssh-keygen -q -t ed25519 -N '' -f "$T/k1" -C KEY1
 SSH_AUTH_SOCK="$T/ag1.sock" ssh-add "$T/k1" >/dev/null 2>&1
-run register-agent "$T/ag1.sock" >/dev/null 2>&1 && ok "register-agent" || bad "register-agent"
+run register-agent --tty "$TTY1" "$T/ag1.sock" >/dev/null 2>&1 && ok "register-agent" || bad "register-agent"
 
 TMUXVAR=$(tmux -L smoke display-message -p '#{socket_path},#{pid},0')
 run_tmux() { env -u XDG_RUNTIME_DIR -u RUNTIME_DIRECTORY TMPDIR="$SOCKET_DIR" TMUX="$TMUXVAR" "$BIN" "$@"; }
@@ -157,7 +157,7 @@ TTY2=$(tmux -L smoke list-clients -F '#{client_tty} #{session_name}' | awk '$2==
 ssh-agent -s -a "$T/ag2.sock" >/dev/null
 ssh-keygen -q -t ed25519 -N '' -f "$T/k2" -C KEY2
 SSH_AUTH_SOCK="$T/ag2.sock" ssh-add "$T/k2" >/dev/null 2>&1
-env -u XDG_RUNTIME_DIR -u RUNTIME_DIRECTORY TMPDIR="$SOCKET_DIR" SSH_TTY="$TTY2" \
+env -u XDG_RUNTIME_DIR -u RUNTIME_DIRECTORY -u TMUX TMPDIR="$SOCKET_DIR" SSH_TTY="$TTY2" \
     "$BIN" register-agent "$T/ag2.sock" >/dev/null 2>&1
 
 # Make s2's client the most recently active, so a server-wide heuristic would
@@ -176,6 +176,30 @@ elif [ "$SAW1" = "$SAW2" ] && [ -n "$SAW1" ]; then
   bad "both panes got $SAW1: per-pane routing is not working, fell back to the server-wide heuristic"
 else
   bad "unexpected result; see $T/out.s1 and $T/out.s2"
+fi
+
+head_ "7b. The CLI inside a pane"
+# list-agents in a pane must name the client the proxy routes that pane by and
+# star its registration. It used to compare against the pane's own terminal.
+PANE_ENV="env -u XDG_RUNTIME_DIR -u RUNTIME_DIRECTORY TMPDIR=$SOCKET_DIR"
+tmux -L smoke send-keys -t s1 "$PANE_ENV $BIN list-agents > $T/list.s1 2>&1" Enter
+tmux -L smoke send-keys -t s1 "$PANE_ENV $BIN register-agent $T/ag2.sock > $T/reg.s1 2>&1; echo \$? >> $T/reg.s1" Enter
+sleep 3
+note "list-agents in s1: $(tr '\n' '|' < "$T/list.s1" 2>/dev/null)"
+if grep -qxF "client: $TTY1" "$T/list.s1" 2>/dev/null; then
+  ok "list-agents in a pane names its client ($TTY1)"
+else
+  bad "list-agents in a pane did not name $TTY1"
+fi
+if grep -q "^\* $TTY1: " "$T/list.s1" 2>/dev/null; then
+  ok "list-agents in a pane stars that client's agent"
+else
+  bad "list-agents in a pane did not star $TTY1"
+fi
+if [ "$(tail -1 "$T/reg.s1" 2>/dev/null)" = "1" ] && grep -q -- "--tty $TTY1" "$T/reg.s1"; then
+  ok "register-agent in a pane is refused and suggests --tty $TTY1"
+else
+  bad "register-agent in a pane was not refused; see $T/reg.s1"
 fi
 
 head_ "8. Fallback from outside any pane"

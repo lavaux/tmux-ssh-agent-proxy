@@ -160,7 +160,9 @@ if [ -z "$TMUX" ] && [ -n "$SSH_AUTH_SOCK" ]; then
 fi
 ```
 
-This registers the current SSH agent for the current TTY. When you later use that TTY inside tmux, the proxy forwards to this agent.
+This registers the current SSH agent for the current TTY. When you later attach tmux from that TTY, the proxy forwards requests from that session's panes to this agent.
+
+Register from the login shell, as above, not from inside tmux. A pane has a terminal of its own, which is not the one the proxy routes by, so inside tmux `register-agent` and `remove-agent` refuse to guess and ask for the client terminal with `--tty`. The first line of `list-agents`, run in the pane, names it. Note that `$SSH_AUTH_SOCK` inside tmux is the proxy itself, which is refused as an agent, so pass the real agent socket too.
 
 #### 3. Register a default agent (optional)
 
@@ -177,12 +179,15 @@ Sets the fallback described under "Which agent gets picked". Use `--override` to
 | `proxy [--no-daemon]` | Start the proxy under the tmux server, or run it in the foreground |
 | `install [--shell]` | Add config to `~/.tmux.conf` (and optionally the shell profile) |
 | `uninstall [--shell]` | Remove config from `~/.tmux.conf` (and optionally the shell profile) |
-| `register-agent [SSH_AUTH_SOCK]` | Register an agent for the current TTY |
-| `register-default-agent [--override] [SSH_AUTH_SOCK]` | Register the fallback agent |
-| `remove-agent [TTY]` | Remove the registration for a TTY (defaults to current) |
+| `register-agent [--tty TTY] [SOCKET]` | Register an agent (default `$SSH_AUTH_SOCK`) for a TTY (default: the current one, outside tmux only) |
+| `register-default-agent [--override] [SOCKET]` | Register the fallback agent |
+| `remove-agent [--tty TTY \| TTY]` | Remove the registration for a TTY (default: the current one, outside tmux only) |
 | `clear-agents [--yes]` | Remove all registrations and the default; asks first |
-| `list-agents` / `list` | List registrations, marking the current TTY with `*` |
-| `--help`, `--version` | Usage and version |
+| `list-agents` / `list` | List registrations and mark the one in use with `*` (see below) |
+| `help [COMMAND]`, `COMMAND --help` | Overview, or the full description of one command |
+| `--version` | Version |
+
+`list-agents` outside tmux marks the current TTY's registration. Inside tmux it first prints `client: TTY`, the tmux client the pane belongs to, which is what the proxy picks an agent by, and marks the agent the proxy would use for that pane: the client's registration, or else the default. No mark means the pane gets no agent.
 
 ## Troubleshooting
 
@@ -190,7 +195,7 @@ Sets the fallback described under "Which agent gets picked". Use `--override` to
 Check `tmux-ssh-agent list-agents`. If the list is empty, nothing registered: confirm `$SSH_AUTH_SOCK` was set when your login shell ran the registration snippet. If no tmux client is attached, no agent is returned by design.
 
 **A pane is using the wrong agent.**
-`list-agents` marks the current TTY with `*`. A pane is routed by the session it belongs to, so check that the client attached to that session is the one whose TTY you registered. A process that detached itself from the pane's process tree, such as something started with `setsid`, cannot be traced back to a pane and falls back to the most recently active client.
+Run `tmux-ssh-agent list-agents` in that pane. Its first line names the client the pane is routed by, and `*` marks the agent it gets. A pane is routed by the session it belongs to, so check that the client attached to that session is the one whose TTY you registered. A process that detached itself from the pane's process tree, such as something started with `setsid`, cannot be traced back to a pane and falls back to the most recently active client.
 
 **Registration fails with "is not a socket" or "does not exist".**
 The path is checked before it is stored. A stale `$SSH_AUTH_SOCK` from a dead agent gives this.

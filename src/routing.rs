@@ -49,7 +49,15 @@ static PANE_CACHE: Mutex<Option<CachedPanes>> = Mutex::new(None);
 /// The TTY of the tmux client that owns the process on the other end of
 /// `stream`, or `None` if it cannot be determined.
 pub fn client_tty_for_peer(stream: &UnixStream) -> Option<String> {
-    let pid = peer_pid(stream)?;
+    client_tty_for_pid(peer_pid(stream)?)
+}
+
+/// The TTY of the tmux client that owns process `pid`, found the same way the
+/// proxy routes a connection, or `None` if `pid` is not inside a pane.
+///
+/// The CLI calls this on its own pid so that `list-agents` describes the agent
+/// the proxy would actually hand this pane.
+pub fn client_tty_for_pid(pid: i32) -> Option<String> {
     let ancestry = ancestry(pid);
     let session = lookup_session(&ancestry)?;
     tmux::active_client_in_session(&session)
