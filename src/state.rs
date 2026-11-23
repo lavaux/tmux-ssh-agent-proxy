@@ -32,23 +32,39 @@ pub struct State {
     /// Fallback agent used when no per-TTY agent is registered.
     #[serde(default)]
     pub default_agent: Option<String>,
+    /// Agents switched to from inside tmux (`switch-agent`), keyed by client
+    /// TTY. Kept apart from `agents` so the login registration survives the
+    /// switch and `switch-agent --reset` can go back to it.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub overrides: HashMap<String, String>,
 }
 
 impl State {
     /// Remove stale entries: agent sockets that no longer exist on the
     /// filesystem, and keys that were never valid TTYs (see `BOGUS_TTY_KEYS`).
     fn cleanup(&mut self) {
-        self.agents.retain(|key, path| {
-            if BOGUS_TTY_KEYS.contains(&key.as_str()) {
-                return false;
-            }
-            Path::new(path).exists()
-        });
+        let live = |key: &String, path: &mut String| {
+            !BOGUS_TTY_KEYS.contains(&key.as_str()) && Path::new(path).exists()
+        };
+        self.agents.retain(live);
+        self.overrides.retain(live);
         if let Some(ref default) = self.default_agent {
             if !Path::new(default).exists() {
                 self.default_agent = None;
             }
         }
+    }
+
+    /// The agent for tmux client `tty`: a switched agent, else the client's
+    /// registration, else the default.
+    ///
+    /// Only for an identified client. With no client there is no agent at
+    /// all; see `proxy::get_agent_for_client`.
+    pub fn agent_for(&self, tty: &str) -> Option<&String> {
+        self.overrides
+            .get(tty)
+            .or_else(|| self.agents.get(tty))
+            .or(self.default_agent.as_ref())
     }
 }
 
@@ -350,12 +366,57 @@ mod tests {
                 ("/dev/pts/2".into(), "/nonexistent/agent.sock".into()),
             ]),
             default_agent: Some("/nonexistent/default.sock".into()),
+            overrides: HashMap::from([
+                ("/dev/pts/1".into(), live.to_string_lossy().into_owned()),
+                ("/dev/pts/3".into(), "/nonexistent/switched.sock".into()),
+            ]),
         };
         state.cleanup();
 
         assert!(state.agents.contains_key("/dev/pts/1"));
         assert!(!state.agents.contains_key("/dev/pts/2"));
         assert_eq!(state.default_agent, None);
+        assert!(state.overrides.contains_key("/dev/pts/1"));
+        assert!(!state.overrides.contains_key("/dev/pts/3"));
+    }
+
+    #[test]
+    fn agent_for_prefers_switch_then_registration_then_default() {
+        let mut state = State {
+            agents: HashMap::from([("/dev/pts/1".into(), "/a".into())]),
+            default_agent: Some("/d".into()),
+            overrides: HashMap::from([("/dev/pts/2".into(), "/s".into())]),
+        };
+        assert_eq!(
+            state.agent_for("/dev/pts/1").map(String::as_str),
+            Some("/a")
+        );
+        assert_eq!(
+            state.agent_for("/dev/pts/2").map(String::as_str),
+            Some("/s")
+        );
+        assert_eq!(
+            state.agent_for("/dev/pts/9").map(String::as_str),
+            Some("/d")
+        );
+
+        state.overrides.insert("/dev/pts/1".into(), "/s".into());
+        assert_eq!(
+            state.agent_for("/dev/pts/1").map(String::as_str),
+            Some("/s")
+        );
+
+        state.default_agent = None;
+        assert_eq!(state.agent_for("/dev/pts/9"), None);
+    }
+
+    /// A state file written before `overrides` existed must still load, and
+    /// one without overrides must not grow the key.
+    #[test]
+    fn overrides_are_optional_in_the_file() {
+        let state: State = serde_json::from_str(r#"{"agents":{},"default_agent":null}"#).unwrap();
+        assert!(state.overrides.is_empty());
+        assert!(!serde_json::to_string(&state).unwrap().contains("overrides"));
     }
 
     #[test]
@@ -366,6 +427,7 @@ mod tests {
                 ("unknown".into(), "/tmp/b".into()),
             ]),
             default_agent: None,
+            overrides: HashMap::new(),
         };
         state.cleanup();
         assert!(state.agents.is_empty());

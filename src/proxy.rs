@@ -487,7 +487,7 @@ fn resolve_client_tty(downstream: &UnixStream) -> Option<String> {
 }
 
 /// Look up the agent socket path for the currently active tmux client.
-/// First checks per-TTY registration, then falls back to the default agent.
+/// Uses the client's switched agent, then its registration, then the default.
 /// Returns `None` if no agent is registered and no default is set.
 fn get_agent_for_client(state_file: &StateFile, downstream: &UnixStream) -> Option<String> {
     // Resolve the client before taking the lock: this forks a tmux process, and
@@ -497,13 +497,9 @@ fn get_agent_for_client(state_file: &StateFile, downstream: &UnixStream) -> Opti
 
     state_file
         .with_lock_read(|state| match tty {
-            // A per-TTY registration wins; the default covers a client that has
-            // not registered one.
-            Some(tty) => state
-                .agents
-                .get(&tty)
-                .cloned()
-                .or_else(|| state.default_agent.clone()),
+            // A switched agent, else the client's registration, else the
+            // default: see `State::agent_for`.
+            Some(tty) => state.agent_for(&tty).cloned(),
             // No active tmux client: there is no way to pick an agent, and
             // falling back to the default here would hand keys to whichever
             // agent happened to be registered last.

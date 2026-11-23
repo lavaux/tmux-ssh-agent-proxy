@@ -30,9 +30,10 @@ First the proxy works out which tmux client the request belongs to:
 
 Then, given that client's TTY:
 
-1. If the TTY has a registered agent, that agent is used.
-2. Otherwise the default agent is used, if one is set.
-3. If no tmux client could be identified at all, no agent is returned. There is nothing to identify the caller by, and falling back to the default here would mean handing keys to whichever agent happened to be registered last.
+1. If the client was switched to an agent with `switch-agent`, that agent is used.
+2. Otherwise, if the TTY has a registered agent, that agent is used.
+3. Otherwise the default agent is used, if one is set.
+4. If no tmux client could be identified at all, no agent is returned. There is nothing to identify the caller by, and falling back to the default here would mean handing keys to whichever agent happened to be registered last.
 
 Step 1 of the first list is implemented on Linux (`SO_PEERCRED` plus `/proc`) and on macOS (`LOCAL_PEERPID`, `getpeereid(3)` and libproc). On other unix systems the proxy uses the fallback, which is exact as long as one client is attached.
 
@@ -104,7 +105,7 @@ cp target/release/tmux-ssh-agent ~/.local/bin/
 tmux-ssh-agent install
 ```
 
-This adds a marked block to `~/.tmux.conf`, backing up the original first. Reload tmux after:
+This adds a marked block to `~/.tmux.conf`, backing up the original first: the line that starts the proxy, and the `prefix A` binding for the agent menu (see "Switch agents inside tmux"). Reload tmux after:
 
 ```sh
 tmux source-file ~/.tmux.conf
@@ -172,6 +173,25 @@ tmux-ssh-agent register-default-agent
 
 Sets the fallback described under "Which agent gets picked". Use `--override` to replace an existing default.
 
+#### 4. Switch agents inside tmux (optional)
+
+From a pane, point the tmux client you are using at another agent:
+
+```sh
+tmux-ssh-agent switch-agent /path/to/other/agent.sock
+tmux-ssh-agent switch-agent --reset    # back to the registered agent
+```
+
+The switch applies to every pane routed by that client, and sits on top of the client's registration rather than replacing it: `--reset` drops it, and so does the next `register-agent` for that terminal, since that is a new login. `list-agents` shows it as `TTY (switched): SOCKET`.
+
+`install` also binds `prefix A` to a menu of every agent the proxy knows of (registrations, switches and the default), with the current one starred and a reset entry when the client is switched. The binding is:
+
+```
+bind-key A run-shell -b 'tmux-ssh-agent switch-agent --menu --tty "#{client_tty}"'
+```
+
+`--tty` is needed there because `run-shell` does not run in a pane, so the client cannot be found from the process tree. The menu needs tmux 3.0 or later. Agent paths with characters other than letters, digits and `/._+:@-` are left out of it, because each entry is re-parsed by tmux and by the shell. An existing install keeps its old block, which has no binding: run `uninstall` then `install`, or add the line above by hand.
+
 ## Commands
 
 | Command | Description |
@@ -181,13 +201,14 @@ Sets the fallback described under "Which agent gets picked". Use `--override` to
 | `uninstall [--shell]` | Remove config from `~/.tmux.conf` (and optionally the shell profile) |
 | `register-agent [--tty TTY] [SOCKET]` | Register an agent (default `$SSH_AUTH_SOCK`) for a TTY (default: the current one, outside tmux only) |
 | `register-default-agent [--override] [SOCKET]` | Register the fallback agent |
-| `remove-agent [--tty TTY \| TTY]` | Remove the registration for a TTY (default: the current one, outside tmux only) |
-| `clear-agents [--yes]` | Remove all registrations and the default; asks first |
+| `switch-agent [--tty TTY] (SOCKET \| --reset \| --menu)` | Switch the agent a tmux client uses (default: the client of the current pane), or drop the switch, or pick from a tmux menu |
+| `remove-agent [--tty TTY \| TTY]` | Remove the registration and any switch for a TTY (default: the current one, outside tmux only) |
+| `clear-agents [--yes]` | Remove all registrations, switches and the default; asks first |
 | `list-agents` / `list` | List registrations and mark the one in use with `*` (see below) |
 | `help [COMMAND]`, `COMMAND --help` | Overview, or the full description of one command |
 | `--version` | Version |
 
-`list-agents` outside tmux marks the current TTY's registration. Inside tmux it first prints `client: TTY`, the tmux client the pane belongs to, which is what the proxy picks an agent by, and marks the agent the proxy would use for that pane: the client's registration, or else the default. No mark means the pane gets no agent.
+`list-agents` outside tmux marks the current TTY's registration. Inside tmux it first prints `client: TTY`, the tmux client the pane belongs to, which is what the proxy picks an agent by, and marks the agent the proxy would use for that pane: the client's switched agent, else its registration, else the default. No mark means the pane gets no agent.
 
 ## Troubleshooting
 

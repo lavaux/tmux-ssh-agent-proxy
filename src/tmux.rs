@@ -140,6 +140,24 @@ pub fn set_update_environment(vars: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Show a menu on client `tty` (`tmux display-menu -c TTY ...`). `items` is
+/// display-menu's own argument list after the options: name, key, command
+/// triples. Needs tmux 3.0 or later.
+pub fn display_menu(tty: &str, title: &str, items: &[String]) -> Result<()> {
+    let output = Command::new("tmux")
+        .args(["display-menu", "-c", tty, "-T", title])
+        .args(items)
+        .output()
+        .with_context(|| "Failed to execute tmux display-menu")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "tmux display-menu failed (tmux 3.0 or later is needed): {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Names of all sessions on the server.
 pub fn sessions() -> Option<Vec<String>> {
     let output = Command::new("tmux")

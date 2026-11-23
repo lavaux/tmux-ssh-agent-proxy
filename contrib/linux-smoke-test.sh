@@ -237,6 +237,71 @@ else
   bad "register-agent in a pane was not refused; see $T/reg.s1"
 fi
 
+head_ "8c. switch-agent"
+# s1's client is registered with ag1. Switching it from a pane must reroute
+# that pane to ag2, and --reset must bring ag1 back.
+in_s1() {
+  tmux -L smoke send-keys -t s1 "$1" Enter
+  sleep 3
+}
+in_s1 "$PANE_ENV $BIN switch-agent $T/ag2.sock > $T/sw.s1 2>&1; SSH_AUTH_SOCK=$SOCK ssh-add -l > $T/sw-add.s1 2>&1; $PANE_ENV $BIN list-agents > $T/sw-list.s1 2>&1"
+note "switch-agent in s1: $(tr '\n' '|' < "$T/sw.s1" 2>/dev/null)"
+if grep -q KEY2 "$T/sw-add.s1" 2>/dev/null; then
+  ok "after switch-agent the pane uses the agent it switched to"
+else
+  bad "after switch-agent the pane sees $(grep -o 'KEY[0-9]' "$T/sw-add.s1" 2>/dev/null | head -1 || echo nothing)"
+fi
+if grep -q "^\* $TTY1 (switched): " "$T/sw-list.s1" 2>/dev/null \
+   && grep -q "^  $TTY1: " "$T/sw-list.s1"; then
+  ok "list-agents stars the switch and keeps the registration"
+else
+  bad "list-agents after the switch: $(tr '\n' '|' < "$T/sw-list.s1" 2>/dev/null)"
+fi
+in_s1 "$PANE_ENV $BIN switch-agent --reset > $T/rs.s1 2>&1; SSH_AUTH_SOCK=$SOCK ssh-add -l > $T/rs-add.s1 2>&1"
+if grep -q KEY1 "$T/rs-add.s1" 2>/dev/null; then
+  ok "switch-agent --reset goes back to the registered agent"
+else
+  bad "after --reset the pane sees $(grep -o 'KEY[0-9]' "$T/rs-add.s1" 2>/dev/null | head -1 || echo nothing)"
+fi
+# Not in a pane, so the client is unknown: guessing the most recently active
+# one could switch someone else's client.
+if run_tmux switch-agent "$T/ag2.sock" >/dev/null 2>&1; then
+  bad "switch-agent outside a pane without --tty was accepted"
+else
+  ok "switch-agent outside a pane without --tty is refused"
+fi
+# The menu through the key binding install adds, with only the binary and
+# the state directory changed: prefix A, then the key of ag2's entry.
+# display-menu stays up until a choice is made, hence run-shell -b.
+# Menu entries re-run the binary from tmux's job environment, so that must
+# point at the scratch state, never the user's real one.
+tmux -L smoke set-environment -g TMPDIR "$SOCKET_DIR"
+tmux -L smoke set-environment -gu XDG_RUNTIME_DIR
+tmux -L smoke set-environment -gu RUNTIME_DIRECTORY
+JOB_ENV=$(tmux -L smoke run-shell 'echo "${TMPDIR:-}|${XDG_RUNTIME_DIR:-}|${RUNTIME_DIRECTORY:-}"')
+if [ "$JOB_ENV" != "$SOCKET_DIR||" ]; then
+  bad "tmux jobs do not see the scratch state dir ($JOB_ENV); skipped the menu test"
+else
+  BIND=$("$BIN" help switch-agent | grep 'bind-key A' | sed -e 's/^ *//' -e "s|tmux-ssh-agent|$BIN|")
+  tmux -L smoke source-file - <<<"$BIND"
+  # Entries are registrations sorted by terminal, and the menu opens on the
+  # first. Select by moving down to ag2's: tmux ignores digit keys sent with
+  # send-keys -K, although typing them works.
+  if [[ "$TTY1" < "$TTY2" ]]; then DOWNS="Down"; else DOWNS=""; fi
+  tmux -L smoke send-keys -K -c "$TTY1" C-b A
+  sleep 2
+  # shellcheck disable=SC2086
+  tmux -L smoke send-keys -K -c "$TTY1" $DOWNS Enter
+  sleep 2
+  run_tmux list-agents > "$T/menu-list" 2>&1
+  if grep -q "$TTY1 (switched): .*ag2.sock" "$T/menu-list"; then
+    ok "prefix A opens the menu and picking ag2 switches $TTY1"
+  else
+    bad "the menu did not switch $TTY1: $(tr '\n' '|' < "$T/menu-list")"
+  fi
+  run_tmux switch-agent --tty "$TTY1" --reset >/dev/null 2>&1
+fi
+
 head_ "9. Fallback from outside any pane"
 if [ -n "$SOCK" ] && SSH_AUTH_SOCK="$SOCK" timeout 15 ssh-add -l 2>/dev/null | grep -q 'KEY[0-9]'; then
   ok "a request from outside tmux still resolves an agent"

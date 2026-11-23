@@ -19,6 +19,15 @@ pub const MARKER_END: &str = "# End tmux-ssh-agent";
 /// The line added to `~/.tmux.conf`.
 pub const TMUX_RUN_LINE: &str = "run 'tmux-ssh-agent proxy'";
 
+/// The key binding added to `~/.tmux.conf`: `prefix A` opens the agent menu.
+///
+/// `run-shell` is not in a pane, so `switch-agent` cannot find the client by
+/// walking up from itself; tmux expands `#{client_tty}` to the client that
+/// pressed the key instead. `-b` because `display-menu` only returns once the
+/// menu is closed, and that client's command queue should not wait on it.
+pub const TMUX_BIND_LINE: &str =
+    "bind-key A run-shell -b 'tmux-ssh-agent switch-agent --menu --tty \"#{client_tty}\"'";
+
 /// Which syntax a shell profile wants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Shell {
@@ -45,6 +54,13 @@ pub fn shell_snippet(shell: Shell) -> Vec<String> {
 }
 
 /// The body added to `~/.tmux.conf`.
+pub fn tmux_block() -> Vec<String> {
+    vec![TMUX_RUN_LINE.to_string(), TMUX_BIND_LINE.to_string()]
+}
+
+/// The one-line body older versions wrote, and the one the README has users
+/// add by hand. It is how a block without markers is recognised, both to
+/// keep `install` from adding a second one and for `uninstall` to remove it.
 pub fn tmux_snippet() -> Vec<String> {
     vec![TMUX_RUN_LINE.to_string()]
 }
@@ -261,6 +277,29 @@ mod tests {
             Removal::Removed(back) => assert_eq!(back, original),
             other => panic!("expected removal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_tmux_block_installs_and_uninstalls_whole() {
+        let original = "# my tmux config\nset -g mouse on\n";
+        let added = add_block(original, &tmux_block()).expect("block added");
+        assert!(added.contains(TMUX_RUN_LINE));
+        assert!(added.contains(TMUX_BIND_LINE));
+
+        // Uninstall passes the legacy one-line body; the markers still bound
+        // the whole two-line block.
+        match remove_block(&added, &tmux_snippet()) {
+            Removal::Removed(back) => assert_eq!(back, original),
+            other => panic!("expected removal, got {other:?}"),
+        }
+    }
+
+    /// The two-line block cannot be matched line for line against a hand
+    /// written run line, so install checks the legacy body for that.
+    #[test]
+    fn a_hand_written_run_line_is_recognised_by_the_legacy_body() {
+        let manual = format!("# set up by hand\n{TMUX_RUN_LINE}\n");
+        assert!(has_block(&manual, &tmux_snippet()));
     }
 
     #[test]

@@ -120,6 +120,34 @@ first line of list-agents, run in the pane, names the terminal to use.
 ",
     },
     CommandHelp {
+        name: "switch-agent",
+        aliases: &[],
+        synopsis: "[--tty TTY] (SOCKET | --reset | --menu)",
+        summary: "Switch the agent a tmux client uses, from inside tmux",
+        details: "\
+Makes the tmux client this pane belongs to use the SSH agent at SOCKET, for
+every pane routed by that client. The client's login registration is kept: the
+switch sits on top of it until --reset, or until register-agent runs for that
+terminal again (a new login).
+
+Arguments:
+  SOCKET      The agent socket. It must be an existing socket owned by you,
+              and not the proxy's own socket.
+
+Options:
+  --reset     Drop the switch, going back to the client's registration, or
+              else the default agent.
+  --menu      Pick the agent from a tmux menu listing every agent known from
+              registrations, switches and the default. Needs tmux 3.0.
+  --tty TTY   The client terminal to act on, as shown by list-agents.
+              Defaults to the client of the pane this runs in. Required when
+              not run from a pane, e.g. from run-shell or a key binding.
+
+install binds the menu to prefix + A:
+  bind-key A run-shell -b 'tmux-ssh-agent switch-agent --menu --tty \"#{client_tty}\"'
+",
+    },
+    CommandHelp {
         name: "register-default-agent",
         aliases: &[],
         synopsis: "[--override] [SOCKET]",
@@ -145,8 +173,8 @@ Options:
         synopsis: "[--tty TTY | TTY]",
         summary: "Remove the agent registered for a terminal",
         details: "\
-Removes the registration for terminal TTY. The default agent is not touched;
-clear-agents removes that.
+Removes the registration for terminal TTY, and any switch-agent switch for
+it. The default agent is not touched; clear-agents removes that.
 
 Arguments:
   TTY, --tty TTY   The terminal whose registration to remove, as shown by
@@ -160,7 +188,8 @@ Arguments:
         synopsis: "[--yes]",
         summary: "Remove every registration and the default agent",
         details: "\
-Removes every per-terminal registration and the default agent. Asks for
+Removes every per-terminal registration, every switch-agent switch and the
+default agent. Asks for
 confirmation first.
 
 Options:
@@ -173,7 +202,8 @@ Options:
         synopsis: "",
         summary: "List registrations and mark the one in use with '*'",
         details: "\
-Lists the default agent and each registered terminal with its agent.
+Lists the default agent, each registered terminal with its agent, and each
+terminal switched to another agent with switch-agent, marked '(switched)'.
 Registrations whose agent socket no longer exists are dropped as a side
 effect.
 
@@ -181,7 +211,8 @@ Outside tmux, '*' marks the registration of the terminal you run it from.
 
 Inside tmux, the first line names the tmux client this pane belongs to, which
 is what the proxy chooses an agent by, and '*' marks the agent the proxy
-would use for this pane: that client's registration, or else the default.
+would use for this pane: that client's switched agent, else its registration,
+else the default.
 No '*' means this pane gets no agent: register one for that client terminal
 with 'register-agent --tty', or set a default.
 ",
@@ -286,6 +317,7 @@ pub fn run() -> Result<()> {
         "proxy" => cmd_proxy(rest),
         "register-agent" => cmd_register_agent(rest),
         "register-default-agent" => cmd_register_default_agent(rest),
+        "switch-agent" => cmd_switch_agent(rest),
         "install" => cmd_install(rest),
         "uninstall" => cmd_uninstall(rest),
         "list-agents" => cmd_list_agents(rest),
@@ -540,11 +572,16 @@ fn cmd_install(args: &[String]) -> Result<()> {
     reject_unknown_flags(args, &["--shell"])?;
     let add_shell = args.contains(&"--shell".to_string());
 
-    apply_install(&home()?.join(".tmux.conf"), &config_edit::tmux_snippet())?;
+    apply_install(
+        &home()?.join(".tmux.conf"),
+        &config_edit::tmux_block(),
+        &config_edit::tmux_snippet(),
+    )?;
 
     if add_shell {
         let (path, shell) = detect_profile()?;
-        apply_install(&path, &config_edit::shell_snippet(shell))?;
+        let body = config_edit::shell_snippet(shell);
+        apply_install(&path, &body, &body)?;
     }
 
     println!("Install complete. Reload tmux: tmux source-file ~/.tmux.conf");
@@ -558,14 +595,20 @@ fn cmd_install(args: &[String]) -> Result<()> {
 }
 
 /// Add our block to `path`, backing the file up first if it has content.
-fn apply_install(path: &Path, body: &[String]) -> Result<()> {
+/// Nothing is added if `legacy`, an older or hand-written form of the block,
+/// is already there.
+fn apply_install(path: &Path, body: &[String], legacy: &[String]) -> Result<()> {
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(e).with_context(|| format!("Failed to read {}", path.display())),
     };
 
-    let Some(updated) = config_edit::add_block(&contents, body) else {
+    let updated = match config_edit::has_block(&contents, legacy) {
+        true => None,
+        false => config_edit::add_block(&contents, body),
+    };
+    let Some(updated) = updated else {
         println!("Already present in {}", path.display());
         return Ok(());
     };
@@ -668,12 +711,22 @@ fn cmd_register_agent(args: &[String]) -> Result<()> {
     refuse_proxy_socket(&agent)?;
 
     let state_file = StateFile::open_default()?;
-    let previous = state_file.with_lock(|state| state.agents.insert(tty.clone(), agent.clone()))?;
+    // A new registration is a new login on that terminal, so a switch made
+    // under the previous one no longer applies.
+    let (previous, switched) = state_file.with_lock(|state| {
+        (
+            state.agents.insert(tty.clone(), agent.clone()),
+            state.overrides.remove(&tty),
+        )
+    })?;
     // Silent otherwise: the login snippet runs this on every login. Dead
     // agents were already dropped by the state cleanup, so this only fires
     // when a live registration is overwritten, which is worth knowing.
     if let Some(old) = previous.filter(|old| *old != agent) {
         eprintln!("Replaced the agent registered for {tty}: was {old}, now {agent}");
+    }
+    if let Some(old) = switched {
+        eprintln!("Dropped the agent {tty} had been switched to: {old}");
     }
     Ok(())
 }
@@ -719,9 +772,214 @@ fn refuse_proxy_socket(agent: &str) -> Result<()> {
     Ok(())
 }
 
+/// What `switch-agent` was asked to do.
+#[derive(Debug, PartialEq, Eq)]
+enum SwitchAction {
+    To(String),
+    Reset,
+    Menu,
+}
+
+/// Parse `switch-agent`'s arguments other than `--tty`.
+fn parse_switch_action(args: &[String]) -> Result<SwitchAction> {
+    reject_unknown_flags(args, &["--reset", "--menu"])?;
+    match args {
+        [] => anyhow::bail!("Name an agent SOCKET, or pass --reset or --menu"),
+        [a] if a == "--reset" => Ok(SwitchAction::Reset),
+        [a] if a == "--menu" => Ok(SwitchAction::Menu),
+        [a] if !a.starts_with('-') => Ok(SwitchAction::To(a.clone())),
+        _ => anyhow::bail!("Give exactly one of SOCKET, --reset or --menu"),
+    }
+}
+
+/// Handle the `switch-agent` subcommand.
+/// Sets (or with `--reset` drops) the agent a tmux client is switched to,
+/// leaving its login registration alone; `--menu` lets tmux ask which one.
+fn cmd_switch_agent(args: &[String]) -> Result<()> {
+    let (tty, rest) = take_option(args, "--tty")?;
+    let action = parse_switch_action(&rest)?;
+    let tty = switch_target_tty(tty)?;
+    let state_file = StateFile::open_default()?;
+
+    match action {
+        SwitchAction::To(agent) => {
+            let agent = crate::ssh_agent::validate_agent_socket(&agent)?;
+            refuse_proxy_socket(&agent)?;
+            state_file.with_lock(|state| state.overrides.insert(tty.clone(), agent.clone()))?;
+            println!("Switched {tty} to {agent}");
+        }
+        SwitchAction::Reset => {
+            let (removed, now) = state_file.with_lock(|state| {
+                let removed = state.overrides.remove(&tty);
+                (removed, state.agent_for(&tty).cloned())
+            })?;
+            let now = match &now {
+                Some(agent) => agent.as_str(),
+                None => "no agent",
+            };
+            match removed {
+                Some(_) => println!("Reset {tty}; it now uses {now}"),
+                None => println!("{tty} was not switched; it uses {now}"),
+            }
+        }
+        SwitchAction::Menu => show_switch_menu(&state_file, &tty)?,
+    }
+    Ok(())
+}
+
+/// The tmux client `switch-agent` acts on: `explicit` if given, else the
+/// client of the pane this runs in.
+///
+/// Unlike `target_tty`, a pane's own client is a fine default here: a switch
+/// does not touch the login registration, and switching the client you are
+/// sitting at is the point of the command. Outside a pane there is still
+/// nothing to go by, and the most recently active client could be someone
+/// else's.
+fn switch_target_tty(explicit: Option<String>) -> Result<String> {
+    if let Some(tty) = explicit {
+        return Ok(tty);
+    }
+    match lookup_client() {
+        ClientLookup::Pane(client) => Ok(client),
+        ClientLookup::NotInTmux => anyhow::bail!(
+            "Not inside tmux, so there is no tmux client to switch. Outside tmux, \
+             use {PROGRAM} register-agent, or name the client with --tty TTY"
+        ),
+        ClientLookup::Fallback(_) | ClientLookup::Unknown => anyhow::bail!(
+            "Inside tmux, and this process is not in a pane, so the tmux client cannot \
+             be identified. Pass it explicitly: {PROGRAM} switch-agent --tty TTY \
+             (from a key binding: --tty '#{{client_tty}}')"
+        ),
+    }
+}
+
+/// One agent the menu offers.
+#[derive(Debug, PartialEq, Eq)]
+struct MenuChoice {
+    label: String,
+    socket: String,
+}
+
+/// Every distinct agent the state knows of, in menu order: registrations by
+/// terminal, the default, then agents only reachable through a switch.
+fn menu_choices(state: &State) -> Vec<MenuChoice> {
+    let mut agents: Vec<_> = state.agents.iter().collect();
+    agents.sort();
+    let mut switched: Vec<_> = state.overrides.iter().collect();
+    switched.sort();
+
+    let mut out: Vec<MenuChoice> = Vec::new();
+    let mut push = |label: String, socket: &String| {
+        if !out.iter().any(|c| c.socket == *socket) {
+            out.push(MenuChoice {
+                label,
+                socket: socket.clone(),
+            });
+        }
+    };
+    for (tty, socket) in agents {
+        push(format!("{tty}: {socket}"), socket);
+    }
+    if let Some(socket) = &state.default_agent {
+        push(format!("default: {socket}"), socket);
+    }
+    for (tty, socket) in switched {
+        push(format!("{tty} (switched): {socket}"), socket);
+    }
+    out
+}
+
+/// Whether `s` can go into a tmux menu command as is.
+///
+/// Each item's command is parsed again by tmux, which also expands `#`
+/// formats, and then by `sh` under run-shell. Rather than escape for both
+/// layers, anything outside a conservative set is left out of the menu. Agent
+/// sockets and terminals are ordinarily plain paths.
+fn menu_safe(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || "/._+:@-".contains(c))
+}
+
+/// display-menu's item arguments (name, key, command triples) for client
+/// `tty`. `current` is the agent the client uses now, starred; a reset item
+/// is offered when the client is switched. Choices that are not `menu_safe`
+/// are skipped.
+fn menu_items(
+    exe: &str,
+    tty: &str,
+    choices: &[MenuChoice],
+    current: Option<&str>,
+    switched: bool,
+) -> Vec<String> {
+    let keys = "123456789";
+    let mut items = Vec::new();
+    for (i, choice) in choices.iter().filter(|c| menu_safe(&c.socket)).enumerate() {
+        let mark = if current == Some(choice.socket.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        items.push(format!("{mark} {}", choice.label));
+        items.push(keys.get(i..i + 1).unwrap_or("").to_string());
+        items.push(format!(
+            "run-shell \"{exe} switch-agent --tty {tty} {} >/dev/null\"",
+            choice.socket
+        ));
+    }
+    if switched {
+        items.push(String::new()); // separator
+        items.push("Reset to the registered agent".to_string());
+        items.push("r".to_string());
+        items.push(format!(
+            "run-shell \"{exe} switch-agent --tty {tty} --reset >/dev/null\""
+        ));
+    }
+    items
+}
+
+/// Show the `switch-agent --menu` menu on client `tty`.
+fn show_switch_menu(state_file: &StateFile, tty: &str) -> Result<()> {
+    if !menu_safe(tty) {
+        anyhow::bail!("Cannot put terminal {tty:?} in a tmux menu command");
+    }
+    // The menu re-runs this binary. Prefer its full path, which works even
+    // when tmux's run-shell has a different $PATH.
+    let exe = std::env::current_exe()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| menu_safe(p))
+        .unwrap_or_else(|| PROGRAM.to_string());
+
+    let (choices, current, switched) = state_file.with_lock_read(|state| {
+        (
+            menu_choices(state),
+            state.agent_for(tty).cloned(),
+            state.overrides.contains_key(tty),
+        )
+    })?;
+    if choices.is_empty() {
+        anyhow::bail!("No agents registered, so there is nothing to switch to");
+    }
+    for c in choices.iter().filter(|c| !menu_safe(&c.socket)) {
+        eprintln!(
+            "Left out of the menu, its path has unusual characters: {}",
+            c.socket
+        );
+    }
+
+    let items = menu_items(&exe, tty, &choices, current.as_deref(), switched);
+    if items.is_empty() {
+        anyhow::bail!("No agent can be offered in a menu; use {PROGRAM} switch-agent SOCKET");
+    }
+    crate::tmux::display_menu(tty, &format!("SSH agent for {tty}"), &items)
+}
+
 /// What `list-agents` marks with `*`.
 #[derive(Debug, PartialEq, Eq)]
 enum Marker {
+    /// The agent this terminal was switched to (`switch-agent`).
+    Switched(String),
     /// The registration of this terminal.
     Entry(String),
     /// The default agent.
@@ -731,7 +989,8 @@ enum Marker {
 
 /// Decide which line `list-agents` stars.
 ///
-/// `client` is the terminal to look up, `None` if it is unknown. With
+/// `client` is the terminal to look up, `None` if it is unknown. A switch
+/// beats the registration, as in the proxy (`State::agent_for`). With
 /// `use_default`, a client with no registration of its own stars the default,
 /// which is what the proxy hands it (`proxy::get_agent_for_client`). Outside
 /// tmux the CLI is not talking to the proxy, so the default means nothing
@@ -740,7 +999,9 @@ fn starred(state: &State, client: Option<&str>, use_default: bool) -> Marker {
     let Some(client) = client else {
         return Marker::Nothing;
     };
-    if state.agents.contains_key(client) {
+    if state.overrides.contains_key(client) {
+        Marker::Switched(client.to_string())
+    } else if state.agents.contains_key(client) {
         Marker::Entry(client.to_string())
     } else if use_default && state.default_agent.is_some() {
         Marker::Default
@@ -786,6 +1047,12 @@ fn cmd_list_agents(args: &[String]) -> Result<()> {
             let on = matches!(&marker, Marker::Entry(t) if t == tty);
             println!("{} {}: {}", mark(on), tty, agent);
         }
+        let mut switched: Vec<_> = state.overrides.iter().collect();
+        switched.sort_by(|a, b| a.0.cmp(b.0));
+        for (tty, agent) in switched {
+            let on = matches!(&marker, Marker::Switched(t) if t == tty);
+            println!("{} {} (switched): {}", mark(on), tty, agent);
+        }
     })
 }
 
@@ -803,11 +1070,15 @@ fn cmd_remove_agent(args: &[String]) -> Result<()> {
     };
     let tty = target_tty(explicit, "remove-agent")?;
     let state_file = StateFile::open_default()?;
-    let removed = state_file.with_lock(|state| state.agents.remove(&tty))?;
+    let (removed, switched) =
+        state_file.with_lock(|state| (state.agents.remove(&tty), state.overrides.remove(&tty)))?;
     if removed.is_some() {
         println!("Removed agent for {}", tty);
     } else {
         println!("No agent registered for {}", tty);
+    }
+    if switched.is_some() {
+        println!("Removed the agent {} was switched to", tty);
     }
     Ok(())
 }
@@ -827,6 +1098,7 @@ fn cmd_clear_agents(args: &[String]) -> Result<()> {
     let state_file = StateFile::open_default()?;
     state_file.with_lock(|state| {
         state.agents.clear();
+        state.overrides.clear();
         state.default_agent = None;
     })?;
     println!("Cleared all agent registrations");
@@ -953,6 +1225,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             default_agent: default.map(str::to_string),
+            overrides: Default::default(),
         }
     }
 
@@ -964,6 +1237,7 @@ mod tests {
         "uninstall",
         "register-agent",
         "register-default-agent",
+        "switch-agent",
         "remove-agent",
         "clear-agents",
         "list-agents",
@@ -1057,5 +1331,103 @@ mod tests {
             starred(&no_default, Some("/dev/pts/9"), true),
             Marker::Nothing
         );
+    }
+
+    #[test]
+    fn star_prefers_a_switch() {
+        let mut s = state(&[("/dev/pts/1", "/a")], Some("/d"));
+        s.overrides.insert("/dev/pts/1".into(), "/s".into());
+        s.overrides.insert("/dev/pts/2".into(), "/s".into());
+        assert_eq!(
+            starred(&s, Some("/dev/pts/1"), true),
+            Marker::Switched("/dev/pts/1".into())
+        );
+        assert_eq!(
+            starred(&s, Some("/dev/pts/2"), false),
+            Marker::Switched("/dev/pts/2".into())
+        );
+    }
+
+    #[test]
+    fn switch_action_parsing() {
+        assert_eq!(
+            parse_switch_action(&strings(&["/s"])).unwrap(),
+            SwitchAction::To("/s".into())
+        );
+        assert_eq!(
+            parse_switch_action(&strings(&["--reset"])).unwrap(),
+            SwitchAction::Reset
+        );
+        assert_eq!(
+            parse_switch_action(&strings(&["--menu"])).unwrap(),
+            SwitchAction::Menu
+        );
+        assert!(parse_switch_action(&[]).is_err());
+        assert!(parse_switch_action(&strings(&["/s", "--reset"])).is_err());
+        assert!(parse_switch_action(&strings(&["/s", "/t"])).is_err());
+        assert!(parse_switch_action(&strings(&["--bogus"])).is_err());
+    }
+
+    #[test]
+    fn menu_lists_each_agent_once() {
+        let mut s = state(&[("/dev/pts/2", "/b"), ("/dev/pts/1", "/a")], Some("/a"));
+        s.overrides.insert("/dev/pts/3".into(), "/s".into());
+        s.overrides.insert("/dev/pts/4".into(), "/b".into());
+        let got: Vec<_> = menu_choices(&s).into_iter().map(|c| c.label).collect();
+        assert_eq!(
+            got,
+            [
+                "/dev/pts/1: /a",
+                "/dev/pts/2: /b",
+                "/dev/pts/3 (switched): /s"
+            ]
+        );
+    }
+
+    #[test]
+    fn menu_items_star_current_and_offer_reset() {
+        let choices = [
+            MenuChoice {
+                label: "/dev/pts/1: /a".into(),
+                socket: "/a".into(),
+            },
+            MenuChoice {
+                label: "bad".into(),
+                socket: "/x y;rm".into(),
+            },
+            MenuChoice {
+                label: "default: /d".into(),
+                socket: "/d".into(),
+            },
+        ];
+        let items = menu_items("/bin/tsa", "/dev/pts/5", &choices, Some("/d"), true);
+        assert_eq!(
+            items,
+            strings(&[
+                "  /dev/pts/1: /a",
+                "1",
+                "run-shell \"/bin/tsa switch-agent --tty /dev/pts/5 /a >/dev/null\"",
+                "* default: /d",
+                "2",
+                "run-shell \"/bin/tsa switch-agent --tty /dev/pts/5 /d >/dev/null\"",
+                "",
+                "Reset to the registered agent",
+                "r",
+                "run-shell \"/bin/tsa switch-agent --tty /dev/pts/5 --reset >/dev/null\"",
+            ])
+        );
+    }
+
+    #[test]
+    fn menu_safe_rejects_what_tmux_or_sh_would_reinterpret() {
+        assert!(menu_safe("/run/user/1000/ssh-agent.sock"));
+        assert!(menu_safe(
+            "/private/var/folders/2z/_0y8k/T/ssh-Ab3/agent.12"
+        ));
+        for bad in [
+            "", "/a b", "/a;b", "/a#{x}", "/a'b", "/a\"b", "/a$b", "/a`b",
+        ] {
+            assert!(!menu_safe(bad), "{bad}");
+        }
     }
 }
