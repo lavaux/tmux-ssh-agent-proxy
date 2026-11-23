@@ -1,6 +1,6 @@
 [package]
 name = "tmux-ssh-agent"
-version = "0.1.0"
+version = "0.2.0-pre.1"
 edition = "2021"
 rust-version = "1.71"
 description = "Transparent SSH agent proxy for tmux: each client gets its own agent"
