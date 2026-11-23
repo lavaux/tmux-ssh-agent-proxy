@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches:
+      - main
+      - 'release/**'
+
+jobs:
+  release:
+    name: Semantic Release
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write   # push tags + release-commit back to the repo
+      issues: write     # allow semantic-release to comment on issues
+      pull-requests: write
+
+    steps:
+      # fetch-depth: 0 is mandatory — semantic-release walks the full
+      # commit history to decide what the next version should be.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # actions/checkout persists this as a git credential so that
+          # @semantic-release/git can push the release commit and tag.
+          #
+          # The default GITHUB_TOKEN is enough here: the runner mints it for every
+          # job and it can push the release commit and tag. Two cases want a
+          # personal access token instead (create it, then run `releaser token`
+          # or `releaser upgrade --secret <name>`):
+          #   - another workflow must react to the release commit or tag, because
+          #     pushes made with GITHUB_TOKEN trigger no further workflow runs;
+          #   - branch protection rejects pushes made with GITHUB_TOKEN.
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          # No cache: npm here — we cache node_modules directly below,
+          # which is faster (npm ci is skipped entirely on a hit).
+
+      - name: Cache node_modules
+        id: npm-cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          # Key is the exact lock-file hash. Any change to package-lock.json
+          # busts the cache and forces a full npm ci.
+          key: node-modules-${{ hashFiles('package-lock.json') }}
+
+      - name: Install dependencies
+        # Skip when node_modules was restored from cache exactly.
+        # restore-keys are intentionally omitted: a partial node_modules
+        # restore from a different lock-file would leave the tree in an
+        # inconsistent state, so we prefer a clean install over a stale hit.
+        if: steps.npm-cache.outputs.cache-hit != 'true'
+        run: npm ci
+
+      - name: Verify the restored node_modules
+        # A cache hit skips npm ci entirely, so a truncated or half-written cache
+        # entry reaches the release step as a tree that merely looks installed:
+        # semantic-release resolves, one of its own dependencies does not, and the
+        # job dies at import time with ERR_MODULE_NOT_FOUND. npm ls compares the
+        # tree against the lock file; if it does not add up, install from scratch.
+        if: steps.npm-cache.outputs.cache-hit == 'true'
+        run: npm ls --all >/dev/null 2>&1 || npm ci
+
+      - name: Release
+        run: npx semantic-release
+        env:
+          # Used by @semantic-release/git for git push authentication
+          # and by @semantic-release/github for the Releases API.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+          # Identity used for the chore(release): commit written back
+          # by @semantic-release/git. Change the name/email to taste.
+          GIT_AUTHOR_NAME: semantic-release-bot
+          GIT_AUTHOR_EMAIL: semantic-release-bot@users.noreply.github.com
+          GIT_COMMITTER_NAME: semantic-release-bot
+          GIT_COMMITTER_EMAIL: semantic-release-bot@users.noreply.github.com

@@ -1,0 +1,28 @@
+{
+  "_comment": "Managed by releaser. Commit this file. Run `releaser upgrade` to refresh the release tooling.",
+  "releaser_version": "1.1.0-pre.6",
+  "forge": "github",
+  "forge_url": "https://git.aquila-consortium.org",
+  "secret_name": "GITHUB_TOKEN",
+  "bot_name": "semantic-release-bot",
+  "bot_email": "semantic-release-bot@users.noreply.github.com",
+  "version_hook": true,
+  "managed": {
+    ".releaserc.json": {
+      "sha256": "3bdbd3369a11f2b7398651c901afd7936bb214f99bf05d1545dccc8b09d5367d",
+      "plugins_sha256": "bbc9a3577591556280b50e20aaf085b0fdb5da0f3f5d1b9f4ff9d14ea9aa4b8d"
+    },
+    ".github/workflows/release.yml": {
+      "sha256": "e9be8058b8ab1146ba5887360dec5ae181ced277505fdfcdd10c728b035ade69"
+    },
+    "build_tools/commit-analyzer.mjs": {
+      "sha256": "eed696fa9e50cd2a5869b6f6422584c6fd4c2afc5cfb4247e9ae491c0e7eb0d8"
+    },
+    "build_tools/release.sh": {
+      "sha256": "1a5d14a513afb80beed585b98d2785535c7ad1d90613c36c6828e82597403e67"
+    }
+  },
+  "project_owned": [
+    "build_tools/set-versions.js"
+  ]
+}
